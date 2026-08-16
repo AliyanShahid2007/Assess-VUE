@@ -1,0 +1,3 @@
+# Deny all access to sensitive upload directory
+# This directory contains private student documents
+Deny from all

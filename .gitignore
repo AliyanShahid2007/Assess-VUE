@@ -1,0 +1,14 @@
+# Uploaded files (contain sensitive data)
+uploads/profiles/*
+uploads/cnic_front/*
+uploads/cnic_back/*
+uploads/pdfs/*
+uploads/temp/*
+!uploads/*/.gitkeep
+
+# Environment/config overrides
+.env
+*.log
+
+# PM2
+.pm2/
