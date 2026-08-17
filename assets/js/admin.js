@@ -1,5 +1,5 @@
 /* ============================================================
-   ExamPortal Pro — Admin JavaScript
+   AssessVUE — Admin JavaScript
    ============================================================ */
 
 // Sidebar toggle

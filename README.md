@@ -1,4 +1,4 @@
-# ExamPortal Pro — Professional Online Examination Simulator
+# AssessVUE — Professional Online Examination Simulator
 
 A complete, professional, secure, and responsive Online Examination Management System built with **PHP + MySQL + Bootstrap 5**.
 

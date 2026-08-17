@@ -35,9 +35,9 @@ if ($attempt['status'] === 'terminated') {
 }
 
 // Server-side timer check
-$startTs = strtotime($attempt['start_time']);
-$expEnd  = strtotime($attempt['expected_end_time']);
-$nowTs   = time();
+$startTs       = strtotime($attempt['start_time']);
+$expEnd        = strtotime($attempt['expected_end_time']);
+$nowTs         = time();
 $remainSeconds = max(0, $expEnd - $nowTs);
 
 // Auto-submit if time expired
@@ -56,64 +56,82 @@ $questions = db()->fetchAll("
     [$attemptId]
 );
 
-$totalQ = count($questions);
-$qNum   = max(1, min($totalQ, sanitizeInt($_GET['q'] ?? $attempt['current_question'])));
-
+$totalQ  = count($questions);
+$qNum    = max(1, min($totalQ, sanitizeInt($_GET['q'] ?? $attempt['current_question'])));
 $currentQ = $questions[$qNum - 1] ?? null;
 
 // Violation count
 $violations = db()->fetchOne("SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId])['c'] ?? 0;
 
-// Summary stats for navigation
+// Summary stats
 $answered = 0; $marked = 0;
 foreach ($questions as $q) {
     if ($q['is_answered']) $answered++;
-    if ($q['is_marked']) $marked++;
+    if ($q['is_marked'])   $marked++;
 }
 
-// ---- AJAX answer save ----
+// ============================================================
+// AJAX answer save  — FIX: always pull marks from exam_questions
+// ============================================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_save'])) {
     header('Content-Type: application/json');
-    $qid     = sanitizeInt($_POST['question_id'] ?? 0);
-    $answer  = strtoupper(trim($_POST['answer'] ?? ''));
-    $isMark  = (int)(bool)($_POST['mark'] ?? false);
+
+    $qid    = sanitizeInt($_POST['question_id'] ?? 0);
+    $answer = strtoupper(trim($_POST['answer'] ?? ''));
+    $isMark = (int)(bool)($_POST['mark'] ?? false);
 
     if (!in_array($answer, ['A','B','C','D',''])) {
-        echo json_encode(['success' => false]); exit;
+        echo json_encode(['success' => false, 'error' => 'invalid answer']); exit;
     }
 
-    $qa = db()->fetchOne("SELECT * FROM student_answers WHERE attempt_id=? AND question_id=?", [$attemptId, $qid]);
-    if (!$qa) { echo json_encode(['success' => false]); exit; }
+    $qa = db()->fetchOne(
+        "SELECT * FROM student_answers WHERE attempt_id=? AND question_id=?",
+        [$attemptId, $qid]
+    );
+    if (!$qa) { echo json_encode(['success' => false, 'error' => 'qa not found']); exit; }
 
-    $isAnswered = $answer !== '';
-    $isCorrect  = $answer !== '' ? ($answer === $qa['correct_option'] ? 1 : 0) : null;
+    $isAnswered = ($answer !== '');
+    $isCorrect  = $isAnswered ? ($answer === $qa['correct_option'] ? 1 : 0) : null;
 
-    // Marks
+    // Always fetch marks from exam_questions (the authoritative source)
+    $eq = db()->fetchOne(
+        "SELECT marks, negative_marks FROM exam_questions WHERE exam_id=? AND question_id=?",
+        [$attempt['exam_db_id'], $qid]
+    );
+    $posMarks = $eq ? (float)$eq['marks']          : (float)$attempt['marks_per_question'];
+    $negMarks = $eq ? (float)$eq['negative_marks']  : (float)$attempt['negative_marks'];
+
     $marks = 0;
     if ($isAnswered) {
-        if ($isCorrect) {
-            $qa2 = db()->fetchOne("SELECT marks FROM student_answers WHERE attempt_id=? AND question_id=?", [$attemptId, $qid]);
-            $marks = (float)($qa2['marks_awarded'] ?? $attempt['marks_per_question']);
-            // Get actual marks from exam_questions
-            $eq = db()->fetchOne("SELECT marks, negative_marks FROM exam_questions WHERE exam_id=? AND question_id=?", [$attempt['exam_db_id'], $qid]);
-            if ($eq) $marks = (float)$eq['marks'];
-        } else {
-            $eq = db()->fetchOne("SELECT negative_marks FROM exam_questions WHERE exam_id=? AND question_id=?", [$attempt['exam_db_id'], $qid]);
-            $marks = -(float)($eq ? $eq['negative_marks'] : $attempt['negative_marks']);
-        }
+        $marks = $isCorrect ? $posMarks : -$negMarks;
     }
 
-    db()->execute("UPDATE student_answers SET selected_option=?, is_answered=?, is_correct=?, is_marked=?, marks_awarded=?, answered_at=NOW() WHERE attempt_id=? AND question_id=?",
-        [$answer ?: null, $isAnswered ? 1 : 0, $isCorrect, $isMark, $marks, $attemptId, $qid]);
+    db()->execute(
+        "UPDATE student_answers
+         SET selected_option=?, is_answered=?, is_correct=?, is_marked=?, marks_awarded=?, answered_at=NOW()
+         WHERE attempt_id=? AND question_id=?",
+        [$answer ?: null, $isAnswered ? 1 : 0, $isCorrect, $isMark, $marks, $attemptId, $qid]
+    );
 
-    // Update current question
-    db()->execute("UPDATE exam_attempts SET current_question=? WHERE id=?", [$qNum, $attemptId]);
+    // Track current question position
+    db()->execute(
+        "UPDATE exam_attempts SET current_question=? WHERE id=?",
+        [$qNum, $attemptId]
+    );
 
-    echo json_encode(['success' => true, 'answered' => $isAnswered, 'marked' => (bool)$isMark]);
+    echo json_encode([
+        'success'    => true,
+        'answered'   => $isAnswered,
+        'marked'     => (bool)$isMark,
+        'is_correct' => $isCorrect,
+        'marks'      => $marks,
+    ]);
     exit;
 }
 
-// ---- AJAX violation record ----
+// ============================================================
+// AJAX violation record
+// ============================================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['record_violation'])) {
     header('Content-Type: application/json');
     $type = trim($_POST['violation_type'] ?? 'tab_switch');
@@ -122,15 +140,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['record_violation'])) 
     $vCount = db()->fetchOne("SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId])['c'] ?? 0;
     $vCount++;
 
-    db()->execute("INSERT INTO exam_violations (attempt_id, student_id, exam_id, violation_type, description, violation_count) VALUES (?,?,?,?,?,?)",
-        [$attemptId, $studentId, $attempt['exam_db_id'], $type, $desc, $vCount]);
+    db()->execute(
+        "INSERT INTO exam_violations (attempt_id, student_id, exam_id, violation_type, description, violation_count)
+         VALUES (?,?,?,?,?,?)",
+        [$attemptId, $studentId, $attempt['exam_db_id'], $type, $desc, $vCount]
+    );
 
-    $maxV = (int)$attempt['max_violations'];
+    $maxV       = (int)$attempt['max_violations'];
     $terminated = false;
     if ($maxV > 0 && $vCount >= $maxV) {
-        // Terminate
-        db()->execute("UPDATE exam_attempts SET status='terminated', termination_reason='Max violations exceeded', end_time=NOW() WHERE id=?", [$attemptId]);
-        // Calculate result with FAIL
+        db()->execute(
+            "UPDATE exam_attempts SET status='terminated', termination_reason='Max violations exceeded', end_time=NOW() WHERE id=?",
+            [$attemptId]
+        );
         calculateAndSaveResult($attemptId, $studentId, $attempt['exam_db_id'], $attempt, true);
         $terminated = true;
     }
@@ -139,7 +161,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['record_violation'])) 
     exit;
 }
 
-// ---- AJAX finish exam ----
+// ============================================================
+// AJAX finish exam
+// ============================================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['finish_exam'])) {
     header('Content-Type: application/json');
     autoSubmitExam($attemptId, $studentId, $attempt['exam_db_id'], $attempt);
@@ -147,24 +171,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['finish_exam'])) {
     exit;
 }
 
+// ============================================================
+// Helper functions
+// ============================================================
 function autoSubmitExam(int $attemptId, int $studentId, int $examId, array $attempt): void {
-    db()->execute("UPDATE exam_attempts SET status='completed', end_time=NOW(), time_taken_seconds=TIMESTAMPDIFF(SECOND,start_time,NOW()) WHERE id=?", [$attemptId]);
+    db()->execute(
+        "UPDATE exam_attempts SET status='completed', end_time=NOW(), time_taken_seconds=TIMESTAMPDIFF(SECOND,start_time,NOW()) WHERE id=?",
+        [$attemptId]
+    );
     db()->execute("UPDATE exam_schedules SET status='completed' WHERE id=?", [$attempt['schedule_id']]);
     calculateAndSaveResult($attemptId, $studentId, $examId, $attempt, false);
 }
 
 function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, array $attempt, bool $violated): void {
-    // Check if result already exists
     if (db()->fetchOne("SELECT id FROM exam_results WHERE attempt_id=?", [$attemptId])) return;
 
     $answers = db()->fetchAll("SELECT * FROM student_answers WHERE attempt_id=?", [$attemptId]);
 
-    $total   = count($answers);
-    $correct = 0; $incorrect = 0; $unanswered = 0;
-    $obtained = 0; $negTotal = 0;
+    $total      = count($answers);
+    $correct    = 0;
+    $incorrect  = 0;
+    $unanswered = 0;
+    $obtained   = 0;
+    $negTotal   = 0;
 
-    // Get exam total marks
-    $exam = db()->fetchOne("SELECT total_marks, passing_percentage FROM exams WHERE id=?", [$examId]);
+    $exam       = db()->fetchOne("SELECT total_marks, passing_percentage FROM exams WHERE id=?", [$examId]);
     $totalMarks = (float)($exam['total_marks'] ?? 100);
     $passPct    = (float)($exam['passing_percentage'] ?? 60);
 
@@ -176,8 +207,8 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
             $obtained += (float)$a['marks_awarded'];
         } else {
             $incorrect++;
-            $obtained += (float)$a['marks_awarded']; // negative marks already negative
-            if ($a['marks_awarded'] < 0) $negTotal += abs((float)$a['marks_awarded']);
+            $obtained += (float)$a['marks_awarded']; // already negative if neg marking
+            if ((float)$a['marks_awarded'] < 0) $negTotal += abs((float)$a['marks_awarded']);
         }
     }
 
@@ -186,11 +217,17 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
 
     $att = db()->fetchOne("SELECT time_taken_seconds, schedule_id FROM exam_attempts WHERE id=?", [$attemptId]);
 
-    db()->execute("INSERT IGNORE INTO exam_results (attempt_id, student_id, exam_id, schedule_id, total_questions, attempted_questions, correct_answers, incorrect_answers, unanswered, total_marks, obtained_marks, negative_marks_total, percentage, passing_percentage, result, violation_terminated, time_taken_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    db()->execute(
+        "INSERT IGNORE INTO exam_results
+         (attempt_id, student_id, exam_id, schedule_id, total_questions, attempted_questions,
+          correct_answers, incorrect_answers, unanswered, total_marks, obtained_marks,
+          negative_marks_total, percentage, passing_percentage, result, violation_terminated, time_taken_seconds)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [$attemptId, $studentId, $examId, $att['schedule_id'],
          $total, $correct + $incorrect, $correct, $incorrect, $unanswered,
          $totalMarks, max(0, $obtained), $negTotal, $pct, $passPct, $result,
-         $violated ? 1 : 0, $att['time_taken_seconds'] ?? 0]);
+         $violated ? 1 : 0, $att['time_taken_seconds'] ?? 0]
+    );
 }
 
 ?>
@@ -203,8 +240,37 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
     <link rel="stylesheet" href="../assets/css/student.css">
+    <style>
+        /* Save-state indicator */
+        .save-indicator {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            z-index: 2000;
+            padding: .5rem 1rem;
+            border-radius: 30px;
+            font-size: .82rem;
+            font-weight: 600;
+            display: none;
+            gap: .4rem;
+            align-items: center;
+            box-shadow: 0 4px 14px rgba(0,0,0,.18);
+            transition: opacity .3s;
+        }
+        .save-indicator.saving  { display: flex; background: #fff3e0; color: #e65100; border: 1px solid #ffe082; }
+        .save-indicator.saved   { display: flex; background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
+        .save-indicator.error   { display: flex; background: #ffebee; color: #b71c1c; border: 1px solid #ef9a9a; }
+        /* Nav btn cursor pointer fix */
+        .q-nav-btn { cursor: pointer; }
+    </style>
 </head>
 <body class="exam-mode">
+
+<!-- Save Indicator Toast -->
+<div class="save-indicator" id="saveIndicator">
+    <i class="fas fa-circle-notch fa-spin" id="saveIcon"></i>
+    <span id="saveText">Saving...</span>
+</div>
 
 <!-- Exam Top Bar -->
 <div class="exam-topbar">
@@ -222,7 +288,7 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
     </div>
 </div>
 
-<!-- Violation Overlay (hidden) -->
+<!-- Violation Overlay -->
 <div class="violation-overlay d-none" id="violationOverlay">
     <div class="violation-box">
         <div style="font-size:3rem" class="text-danger mb-3"><i class="fas fa-exclamation-triangle"></i></div>
@@ -238,15 +304,13 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
     </div>
 </div>
 
-<!-- Terminated Overlay (hidden) -->
+<!-- Terminated Overlay -->
 <div class="violation-overlay d-none" id="terminatedOverlay">
     <div class="violation-box">
         <div style="font-size:3rem" class="text-danger mb-3"><i class="fas fa-ban"></i></div>
         <h4 class="text-danger fw-bold">Examination Terminated</h4>
         <p>You have exceeded the maximum allowed violations. Your examination has been automatically terminated and marked as <strong>FAIL</strong>.</p>
-        <a href="result_view.php?attempt_id=<?= $attemptId ?>" class="btn btn-danger px-4 mt-2">
-            View Result
-        </a>
+        <a href="result_view.php?attempt_id=<?= $attemptId ?>" class="btn btn-danger px-4 mt-2">View Result</a>
     </div>
 </div>
 
@@ -265,7 +329,7 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
 
             <div id="optionsContainer">
                 <?php foreach (['A','B','C','D'] as $opt):
-                    $key = 'option_' . strtolower($opt);
+                    $key   = 'option_' . strtolower($opt);
                     $isSel = $currentQ['selected_option'] === $opt;
                 ?>
                 <label class="option-label <?= $isSel ? 'selected' : '' ?>" data-option="<?= $opt ?>"
@@ -277,30 +341,34 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
                 <?php endforeach; ?>
             </div>
 
+            <!-- Exam action buttons — all JS-driven for safe async save -->
             <div class="exam-actions mt-3">
                 <?php if ($qNum > 1): ?>
-                <a href="exam.php?attempt_id=<?= $attemptId ?>&q=<?= $qNum-1 ?>" class="btn btn-outline-secondary">
+                <button type="button" class="btn btn-outline-secondary" onclick="goToQuestion(<?= $qNum-1 ?>)">
                     <i class="fas fa-arrow-left me-1"></i>Previous
-                </a>
+                </button>
                 <?php endif; ?>
 
-                <button type="button" class="btn <?= $currentQ['is_marked'] ? 'btn-warning' : 'btn-outline-warning' ?>" id="markBtn"
+                <button type="button"
+                        class="btn <?= $currentQ['is_marked'] ? 'btn-warning' : 'btn-outline-warning' ?>"
+                        id="markBtn"
                         onclick="toggleMark()">
                     <i class="fas fa-bookmark me-1"></i>
                     <?= $currentQ['is_marked'] ? 'Unmark' : 'Mark for Review' ?>
                 </button>
 
                 <?php if ($qNum < $totalQ): ?>
-                <a href="exam.php?attempt_id=<?= $attemptId ?>&q=<?= $qNum+1 ?>" class="btn btn-primary">
+                <button type="button" class="btn btn-primary" onclick="goToQuestion(<?= $qNum+1 ?>)">
                     Next <i class="fas fa-arrow-right ms-1"></i>
-                </a>
+                </button>
                 <?php else: ?>
                 <button type="button" class="btn btn-success" onclick="showFinishModal()">
                     <i class="fas fa-flag-checkered me-1"></i>Finish Exam
                 </button>
                 <?php endif; ?>
 
-                <button type="button" class="btn btn-outline-danger ms-auto d-none d-sm-block" onclick="showFinishModal()">
+                <button type="button" class="btn btn-outline-danger ms-auto d-none d-sm-block"
+                        onclick="showFinishModal()">
                     <i class="fas fa-stop me-1"></i>End Exam
                 </button>
             </div>
@@ -313,34 +381,35 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
         <div class="card mb-3">
             <div class="card-header py-2"><i class="fas fa-th me-2"></i>Questions</div>
             <div class="card-body">
-                <div class="d-flex flex-wrap gap-1 mb-3">
+                <div class="d-flex flex-wrap gap-1 mb-3" id="qNavGrid">
                     <?php foreach ($questions as $i => $q): ?>
                     <?php
-                        $n = $i+1;
+                        $n   = $i + 1;
                         $cls = 'unanswered';
-                        if ($n === $qNum) $cls = 'current';
+                        if ($n === $qNum)                              $cls = 'current';
                         elseif ($q['is_answered'] && $q['is_marked']) $cls = 'marked';
-                        elseif ($q['is_answered']) $cls = 'answered';
-                        elseif ($q['is_marked']) $cls = 'marked';
+                        elseif ($q['is_answered'])                    $cls = 'answered';
+                        elseif ($q['is_marked'])                      $cls = 'marked';
                     ?>
-                    <a href="exam.php?attempt_id=<?= $attemptId ?>&q=<?= $n ?>"
-                       class="q-nav-btn <?= $cls ?>"><?= $n ?></a>
+                    <button type="button"
+                            class="q-nav-btn <?= $cls ?>"
+                            onclick="goToQuestion(<?= $n ?>)"><?= $n ?></button>
                     <?php endforeach; ?>
                 </div>
 
                 <!-- Legend -->
                 <div class="nav-legend">
                     <div class="legend-item">
-                        <div class="legend-dot" style="background:#43a047;border:1px solid #43a047;border-radius:3px"></div>
-                        <span>Answered (<?= $answered ?>)</span>
+                        <div class="legend-dot" style="background:#e8f5e9;border:1px solid #43a047;border-radius:3px"></div>
+                        <span>Answered (<span id="legendAnswered"><?= $answered ?></span>)</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-dot" style="background:#fff3e0;border:1px solid #f9a825;border-radius:3px"></div>
-                        <span>Marked (<?= $marked ?>)</span>
+                        <span>Marked (<span id="legendMarked"><?= $marked ?></span>)</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-dot" style="background:#fafafa;border:1px solid #e0e0e0;border-radius:3px"></div>
-                        <span>Not Answered (<?= $totalQ - $answered ?>)</span>
+                        <span>Not Answered (<span id="legendRemaining"><?= $totalQ - $answered ?></span>)</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-dot" style="background:#3949ab;border:1px solid #1a237e;border-radius:3px"></div>
@@ -356,13 +425,13 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
                 <div class="row g-1 text-center">
                     <div class="col-6">
                         <div class="p-2 bg-success bg-opacity-10 rounded">
-                            <div class="fw-bold text-success"><?= $answered ?></div>
+                            <div class="fw-bold text-success" id="summaryAnswered"><?= $answered ?></div>
                             <small class="text-muted">Answered</small>
                         </div>
                     </div>
                     <div class="col-6">
                         <div class="p-2 bg-secondary bg-opacity-10 rounded">
-                            <div class="fw-bold text-secondary"><?= $totalQ - $answered ?></div>
+                            <div class="fw-bold text-secondary" id="summaryRemaining"><?= $totalQ - $answered ?></div>
                             <small class="text-muted">Remaining</small>
                         </div>
                     </div>
@@ -423,17 +492,28 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+// ============================================================
+// Constants from PHP
+// ============================================================
 const ATTEMPT_ID     = <?= $attemptId ?>;
 const CURRENT_Q      = <?= $qNum ?>;
 const CURRENT_Q_ID   = <?= $currentQ ? $currentQ['question_id'] : 0 ?>;
+const TOTAL_Q        = <?= $totalQ ?>;
 const REMAIN_SECONDS = <?= $remainSeconds ?>;
 const MAX_VIOLATIONS = <?= (int)$attempt['max_violations'] ?>;
-let violationCount   = <?= $violations ?>;
-let examSubmitted    = false;
-let selectedAnswer   = <?= json_encode($currentQ ? ($currentQ['selected_option'] ?? '') : '') ?>;
-let isMarked         = <?= $currentQ ? ($currentQ['is_marked'] ? 'true' : 'false') : 'false' ?>;
+const EXAM_BASE_URL  = 'exam.php';
 
-// ---- Timer ----
+let violationCount  = <?= $violations ?>;
+let examSubmitted   = false;
+let selectedAnswer  = <?= json_encode($currentQ ? ($currentQ['selected_option'] ?? '') : '') ?>;
+let isMarked        = <?= $currentQ ? ($currentQ['is_marked'] ? 'true' : 'false') : 'false' ?>;
+let saveInProgress  = false;
+let pendingSave     = false;  // flag: need to save before navigating
+let answeredCount   = <?= $answered ?>;
+
+// ============================================================
+// TIMER
+// ============================================================
 let remainSecs = REMAIN_SECONDS;
 const timerEl  = document.getElementById('examTimer');
 
@@ -446,36 +526,126 @@ function updateTimer() {
     const h = Math.floor(remainSecs / 3600);
     const m = Math.floor((remainSecs % 3600) / 60);
     const s = remainSecs % 60;
-    timerEl.textContent = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    timerEl.textContent =
+        `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 
-    if (remainSecs <= 60) { timerEl.className = 'exam-timer critical'; }
-    else if (remainSecs <= 300) { timerEl.className = 'exam-timer warning'; }
+    if (remainSecs <= 60)       timerEl.className = 'exam-timer critical';
+    else if (remainSecs <= 300) timerEl.className = 'exam-timer warning';
 
     remainSecs--;
     setTimeout(updateTimer, 1000);
 }
 updateTimer();
 
-// ---- Select Answer ----
+// ============================================================
+// SAVE INDICATOR
+// ============================================================
+function showSaveIndicator(state) {  // 'saving' | 'saved' | 'error'
+    const el   = document.getElementById('saveIndicator');
+    const icon = document.getElementById('saveIcon');
+    const txt  = document.getElementById('saveText');
+    el.className = 'save-indicator ' + state;
+    if (state === 'saving') {
+        icon.className = 'fas fa-circle-notch fa-spin';
+        txt.textContent = 'Saving answer…';
+    } else if (state === 'saved') {
+        icon.className = 'fas fa-check-circle';
+        txt.textContent = 'Answer saved!';
+        setTimeout(() => { el.className = 'save-indicator'; }, 1800);
+    } else {
+        icon.className = 'fas fa-exclamation-circle';
+        txt.textContent = 'Save failed — retrying…';
+    }
+}
+
+// ============================================================
+// CORE SAVE FUNCTION — returns Promise<bool>
+// ============================================================
+async function saveAnswerAsync(answer, mark) {
+    if (!CURRENT_Q_ID) return true;
+    saveInProgress = true;
+    showSaveIndicator('saving');
+
+    const fd = new FormData();
+    fd.append('ajax_save',   '1');
+    fd.append('question_id', CURRENT_Q_ID);
+    fd.append('answer',      answer ?? '');
+    fd.append('mark',        mark ? '1' : '0');
+
+    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+
+    try {
+        const res  = await fetch(url, { method: 'POST', body: fd });
+        const data = await res.json();
+        saveInProgress = false;
+        if (data.success) {
+            showSaveIndicator('saved');
+            return true;
+        }
+        showSaveIndicator('error');
+        return false;
+    } catch (e) {
+        saveInProgress = false;
+        showSaveIndicator('error');
+        return false;
+    }
+}
+
+// ============================================================
+// SELECT ANSWER — mark as pending save, then save immediately
+// ============================================================
 function selectAnswer(opt, labelEl) {
+    // Visual update
     document.querySelectorAll('.option-label').forEach(l => l.classList.remove('selected'));
     labelEl.classList.add('selected');
+    const badge = labelEl.querySelector('.option-badge');
+    document.querySelectorAll('.option-badge').forEach(b => {
+        b.style.background = '#e8eaf6';
+        b.style.color = '#3949ab';
+    });
+    if (badge) { badge.style.background = '#3949ab'; badge.style.color = '#fff'; }
+
+    const wasAnswered = (selectedAnswer !== '' && selectedAnswer !== null);
     selectedAnswer = opt;
-    saveAnswer(opt, isMarked ? 1 : 0);
+    pendingSave = true;
+
+    // Update answered count in sidebar if this is a new answer
+    if (!wasAnswered) {
+        answeredCount++;
+        updateSidebarCounts(answeredCount);
+        // Update nav grid button for current question
+        updateNavBtn(CURRENT_Q, 'answered');
+    }
+
+    // Save immediately — do NOT wait (fire-and-forget here; goToQuestion will await)
+    saveAnswerAsync(opt, isMarked ? 1 : 0).then(ok => {
+        pendingSave = !ok;
+    });
 }
 
-function saveAnswer(answer, mark) {
-    const fd = new FormData();
-    fd.append('ajax_save', '1');
-    fd.append('question_id', CURRENT_Q_ID);
-    fd.append('answer', answer);
-    fd.append('mark', mark);
-    fetch(window.location.href.split('?')[0] + '?attempt_id=' + ATTEMPT_ID + '&q=' + CURRENT_Q, {
-        method: 'POST', body: fd
-    }).catch(() => {});
+// ============================================================
+// UPDATE SIDEBAR COUNTERS
+// ============================================================
+function updateSidebarCounts(answered) {
+    const remaining = TOTAL_Q - answered;
+    document.getElementById('legendAnswered').textContent  = answered;
+    document.getElementById('legendRemaining').textContent = remaining;
+    document.getElementById('summaryAnswered').textContent  = answered;
+    document.getElementById('summaryRemaining').textContent = remaining;
+    document.getElementById('finalAnswered').textContent    = answered;
+    document.getElementById('finalUnanswered').textContent  = remaining;
 }
 
-// ---- Mark for Review ----
+function updateNavBtn(qNum, cls) {
+    const btns = document.querySelectorAll('#qNavGrid .q-nav-btn');
+    const btn  = btns[qNum - 1];
+    if (!btn) return;
+    btn.className = 'q-nav-btn ' + cls;
+}
+
+// ============================================================
+// MARK FOR REVIEW
+// ============================================================
 function toggleMark() {
     isMarked = !isMarked;
     const btn = document.getElementById('markBtn');
@@ -483,53 +653,94 @@ function toggleMark() {
         ? '<i class="fas fa-bookmark me-1"></i>Unmark'
         : '<i class="fas fa-bookmark me-1"></i>Mark for Review';
     btn.className = isMarked ? 'btn btn-warning' : 'btn btn-outline-warning';
-    saveAnswer(selectedAnswer || '', isMarked ? 1 : 0);
+
+    // Update nav grid
+    const navCls = selectedAnswer ? (isMarked ? 'marked' : 'answered') : (isMarked ? 'marked' : 'unanswered');
+    updateNavBtn(CURRENT_Q, navCls);
+
+    // Update marked count
+    const markedCount = document.querySelectorAll('#qNavGrid .q-nav-btn.marked').length;
+    document.getElementById('legendMarked').textContent = markedCount;
+
+    saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
 }
 
-// ---- Finish Modal ----
+// ============================================================
+// NAVIGATE — AWAIT SAVE FIRST, THEN REDIRECT
+// ============================================================
+async function goToQuestion(targetQ) {
+    if (examSubmitted) return;
+
+    // If a save is in progress or pending, wait for it
+    if (saveInProgress || pendingSave) {
+        await saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
+        pendingSave = false;
+    }
+
+    // Disable all nav buttons to prevent double-click
+    document.querySelectorAll('.q-nav-btn, .exam-actions .btn').forEach(b => b.disabled = true);
+
+    window.location.href = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${targetQ}`;
+}
+
+// ============================================================
+// FINISH MODAL
+// ============================================================
 const finishModal = new bootstrap.Modal(document.getElementById('finishModal'));
 function showFinishModal() { finishModal.show(); }
 
-// ---- Submit ----
-function submitExam(auto = false) {
+// ============================================================
+// SUBMIT EXAM
+// ============================================================
+async function submitExam(auto = false) {
     if (examSubmitted && !auto) return;
     examSubmitted = true;
+
     const btn = document.getElementById('confirmSubmitBtn');
-    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Submitting...'; }
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Submitting…'; }
+
+    // Save current answer before submitting
+    if (selectedAnswer || isMarked) {
+        await saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
+    }
 
     const fd = new FormData();
     fd.append('finish_exam', '1');
-    fetch(window.location.href.split('?')[0] + '?attempt_id=' + ATTEMPT_ID + '&q=' + CURRENT_Q, {
-        method: 'POST', body: fd
-    })
-    .then(r => r.json())
-    .then(d => { if (d.success) window.location.href = d.redirect; })
-    .catch(() => { window.location.href = 'result_view.php?attempt_id=' + ATTEMPT_ID; });
+    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+
+    try {
+        const res  = await fetch(url, { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) window.location.href = data.redirect;
+    } catch {
+        window.location.href = `result_view.php?attempt_id=${ATTEMPT_ID}`;
+    }
 }
 
-// ---- Violation Monitoring ----
+// ============================================================
+// VIOLATION MONITORING
+// ============================================================
 let violationActive = false;
 
 function recordViolation(type, desc) {
     if (examSubmitted) return;
     const fd = new FormData();
     fd.append('record_violation', '1');
-    fd.append('violation_type', type);
-    fd.append('description', desc);
-    fetch(window.location.href.split('?')[0] + '?attempt_id=' + ATTEMPT_ID + '&q=' + CURRENT_Q, {
-        method: 'POST', body: fd
-    })
-    .then(r => r.json())
-    .then(data => {
-        violationCount = data.count;
-        document.getElementById('vCount').textContent = data.count;
-        if (data.terminated) {
-            document.getElementById('violationOverlay').classList.add('d-none');
-            document.getElementById('terminatedOverlay').classList.remove('d-none');
-        } else {
-            showViolation(desc);
-        }
-    }).catch(() => {});
+    fd.append('violation_type',   type);
+    fd.append('description',      desc);
+    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+    fetch(url, { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            violationCount = data.count;
+            document.getElementById('vCount').textContent = data.count;
+            if (data.terminated) {
+                document.getElementById('violationOverlay').classList.add('d-none');
+                document.getElementById('terminatedOverlay').classList.remove('d-none');
+            } else {
+                showViolation(desc);
+            }
+        }).catch(() => {});
 }
 
 function showViolation(msg) {
@@ -545,33 +756,24 @@ function dismissViolation() {
     violationActive = false;
 }
 
-// Tab visibility
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden && !examSubmitted) {
+    if (document.hidden && !examSubmitted)
         recordViolation('tab_switch', 'Student switched browser tab or minimized window.');
-    }
 });
 
-// Window blur/focus
 window.addEventListener('blur', () => {
     if (!examSubmitted) {
         setTimeout(() => {
-            if (!document.hasFocus() && !examSubmitted) {
+            if (!document.hasFocus() && !examSubmitted)
                 recordViolation('window_blur', 'Student switched to another application or window.');
-            }
         }, 300);
     }
 });
 
-// Before unload
 window.addEventListener('beforeunload', e => {
-    if (!examSubmitted) {
-        e.preventDefault();
-        e.returnValue = '';
-    }
+    if (!examSubmitted) { e.preventDefault(); e.returnValue = ''; }
 });
 
-// Disable right click on exam
 document.addEventListener('contextmenu', e => e.preventDefault());
 </script>
 </body>
