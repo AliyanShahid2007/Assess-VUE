@@ -64,13 +64,26 @@ foreach ($schedules as &$s) {
         $s['avail_status']      = 'upcoming';
         $s['countdown_seconds'] = $startTs - $nowTs;
         $upcomingExams[] = &$s;
-    } elseif ($nowTs >= $startTs && $nowTs <= $endTs + 300 && $s['attempt_allowed']) {
-        $s['avail_status'] = 'available';
-        $liveExams[] = &$s;
+    } elseif ($nowTs >= $startTs && $nowTs <= $endTs + 300) {
+        // Within exam window — always show as available if attempt_allowed
+        if ($s['attempt_allowed'] && $s['status'] !== 'cancelled') {
+            $s['avail_status'] = 'available';
+            // Restore 'missed' or stale status back to 'scheduled' so exam_start.php can find it
+            if ($s['status'] === 'missed' || $s['status'] === 'scheduled') {
+                db()->execute("UPDATE exam_schedules SET status='scheduled' WHERE id=?", [$s['id']]);
+                $s['status'] = 'scheduled';
+            }
+            $liveExams[] = &$s;
+        } else {
+            $s['avail_status'] = 'expired';
+            $pastExams[] = &$s;
+        }
     } else {
         $s['avail_status'] = 'expired';
-        if ($s['status'] === 'scheduled') {
+        // Only mark as missed AFTER the window has truly closed (endTs + 5min grace)
+        if (in_array($s['status'], ['scheduled', 'active']) && $nowTs > $endTs + 300) {
             db()->execute("UPDATE exam_schedules SET status='missed' WHERE id=?", [$s['id']]);
+            $s['status'] = 'missed';
         }
         $pastExams[] = &$s;
     }
