@@ -1,52 +1,70 @@
 <?php
+/**
+ * student/exam.php  — AssessVUE Examination Interface
+ *
+ * KEY ARCHITECTURE:
+ *  • PHP built-in server is single-threaded. To prevent AJAX blocking the next
+ *    page-load, we call session_write_close() immediately after reading session
+ *    data — releasing the session lock so concurrent requests don't queue up.
+ *  • All navigation uses async JS: goToQuestion() awaits saveAnswerAsync() before
+ *    setting window.location.  The save URL is a dedicated save-only endpoint
+ *    (save_answer.php) so the save POST never competes with the next page GET.
+ *  • Marks always come from exam_questions.marks — never from student_answers.
+ */
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/functions.php';
 startSecureSession();
 requireStudent();
 
-$studentId = $_SESSION['student_id'];
-$attemptId = sanitizeInt($_GET['attempt_id'] ?? 0);
+$studentId = (int)$_SESSION['student_id'];
+$attemptId = (int)($_GET['attempt_id'] ?? 0);
 
-// Load attempt
+// Release session lock immediately so AJAX can run concurrently
+session_write_close();
+
+// ── Load attempt ─────────────────────────────────────────────
 $attempt = db()->fetchOne("
     SELECT ea.*, es.scheduled_date, es.start_time as sched_start,
            e.exam_name, e.total_questions, e.max_violations, e.passing_percentage,
            e.marks_per_question, e.negative_marks, e.id as exam_db_id,
-           s.full_name
+           s.full_name, s.profile_picture, s.student_id as stu_code
     FROM exam_attempts ea
     JOIN exam_schedules es ON es.id = ea.schedule_id
-    JOIN exams e ON e.id = ea.exam_id
-    JOIN students s ON s.id = ea.student_id
+    JOIN exams          e  ON e.id  = ea.exam_id
+    JOIN students       s  ON s.id  = ea.student_id
     WHERE ea.id = ? AND ea.student_id = ?",
     [$attemptId, $studentId]
 );
 
 if (!$attempt) {
+    startSecureSession();
     setFlash('error', 'Exam attempt not found.');
-    redirect('dashboard.php');
-}
-if ($attempt['status'] === 'completed') {
-    redirect("result_view.php?attempt_id=$attemptId");
-}
-if ($attempt['status'] === 'terminated') {
-    setFlash('error', 'Your exam was terminated due to rule violations.');
-    redirect('dashboard.php');
+    session_write_close();
+    header('Location: dashboard.php'); exit;
 }
 
-// Server-side timer check
-$startTs       = strtotime($attempt['start_time']);
+if ($attempt['status'] === 'completed') {
+    header("Location: result_view.php?attempt_id=$attemptId"); exit;
+}
+if ($attempt['status'] === 'terminated') {
+    startSecureSession();
+    setFlash('error', 'Your exam was terminated due to rule violations.');
+    session_write_close();
+    header('Location: dashboard.php'); exit;
+}
+
+// ── Server-side timer ────────────────────────────────────────
 $expEnd        = strtotime($attempt['expected_end_time']);
 $nowTs         = time();
 $remainSeconds = max(0, $expEnd - $nowTs);
 
-// Auto-submit if time expired
-if ($remainSeconds <= 0 && $attempt['status'] === 'in_progress') {
-    autoSubmitExam($attemptId, $studentId, $attempt['exam_db_id'], $attempt);
-    redirect("result_view.php?attempt_id=$attemptId");
+if ($remainSeconds <= 0) {
+    autoSubmitExam($attemptId, $studentId, (int)$attempt['exam_db_id'], $attempt);
+    header("Location: result_view.php?attempt_id=$attemptId"); exit;
 }
 
-// Load all questions for this attempt
+// ── Load questions ───────────────────────────────────────────
 $questions = db()->fetchAll("
     SELECT sa.*, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d
     FROM student_answers sa
@@ -56,92 +74,42 @@ $questions = db()->fetchAll("
     [$attemptId]
 );
 
-$totalQ  = count($questions);
-$qNum    = max(1, min($totalQ, sanitizeInt($_GET['q'] ?? $attempt['current_question'])));
+$totalQ   = count($questions);
+$qNum     = max(1, min($totalQ, (int)($_GET['q'] ?? $attempt['current_question'])));
 $currentQ = $questions[$qNum - 1] ?? null;
 
-// Violation count
-$violations = db()->fetchOne("SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId])['c'] ?? 0;
+// ── Violation count ──────────────────────────────────────────
+$violations = (int)(db()->fetchOne(
+    "SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId]
+)['c'] ?? 0);
 
-// Summary stats
+// ── Summary stats ────────────────────────────────────────────
 $answered = 0; $marked = 0;
 foreach ($questions as $q) {
     if ($q['is_answered']) $answered++;
     if ($q['is_marked'])   $marked++;
 }
 
-// ============================================================
-// AJAX answer save  — FIX: always pull marks from exam_questions
-// ============================================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_save'])) {
+// ── AJAX: finish exam ────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['finish_exam'])) {
     header('Content-Type: application/json');
-
-    $qid    = sanitizeInt($_POST['question_id'] ?? 0);
-    $answer = strtoupper(trim($_POST['answer'] ?? ''));
-    $isMark = (int)(bool)($_POST['mark'] ?? false);
-
-    if (!in_array($answer, ['A','B','C','D',''])) {
-        echo json_encode(['success' => false, 'error' => 'invalid answer']); exit;
-    }
-
-    $qa = db()->fetchOne(
-        "SELECT * FROM student_answers WHERE attempt_id=? AND question_id=?",
-        [$attemptId, $qid]
-    );
-    if (!$qa) { echo json_encode(['success' => false, 'error' => 'qa not found']); exit; }
-
-    $isAnswered = ($answer !== '');
-    $isCorrect  = $isAnswered ? ($answer === $qa['correct_option'] ? 1 : 0) : null;
-
-    // Always fetch marks from exam_questions (the authoritative source)
-    $eq = db()->fetchOne(
-        "SELECT marks, negative_marks FROM exam_questions WHERE exam_id=? AND question_id=?",
-        [$attempt['exam_db_id'], $qid]
-    );
-    $posMarks = $eq ? (float)$eq['marks']          : (float)$attempt['marks_per_question'];
-    $negMarks = $eq ? (float)$eq['negative_marks']  : (float)$attempt['negative_marks'];
-
-    $marks = 0;
-    if ($isAnswered) {
-        $marks = $isCorrect ? $posMarks : -$negMarks;
-    }
-
-    db()->execute(
-        "UPDATE student_answers
-         SET selected_option=?, is_answered=?, is_correct=?, is_marked=?, marks_awarded=?, answered_at=NOW()
-         WHERE attempt_id=? AND question_id=?",
-        [$answer ?: null, $isAnswered ? 1 : 0, $isCorrect, $isMark, $marks, $attemptId, $qid]
-    );
-
-    // Track current question position
-    db()->execute(
-        "UPDATE exam_attempts SET current_question=? WHERE id=?",
-        [$qNum, $attemptId]
-    );
-
-    echo json_encode([
-        'success'    => true,
-        'answered'   => $isAnswered,
-        'marked'     => (bool)$isMark,
-        'is_correct' => $isCorrect,
-        'marks'      => $marks,
-    ]);
+    autoSubmitExam($attemptId, $studentId, (int)$attempt['exam_db_id'], $attempt);
+    echo json_encode(['success' => true, 'redirect' => "result_view.php?attempt_id=$attemptId"]);
     exit;
 }
 
-// ============================================================
-// AJAX violation record
-// ============================================================
+// ── AJAX: record violation ───────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['record_violation'])) {
     header('Content-Type: application/json');
-    $type = trim($_POST['violation_type'] ?? 'tab_switch');
-    $desc = trim($_POST['description'] ?? '');
+    $type = substr(trim($_POST['violation_type'] ?? 'tab_switch'), 0, 50);
+    $desc = substr(trim($_POST['description']    ?? ''), 0, 255);
 
-    $vCount = db()->fetchOne("SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId])['c'] ?? 0;
-    $vCount++;
+    $vCount = (int)(db()->fetchOne(
+        "SELECT COUNT(*) c FROM exam_violations WHERE attempt_id=?", [$attemptId]
+    )['c'] ?? 0) + 1;
 
     db()->execute(
-        "INSERT INTO exam_violations (attempt_id, student_id, exam_id, violation_type, description, violation_count)
+        "INSERT INTO exam_violations (attempt_id,student_id,exam_id,violation_type,description,violation_count)
          VALUES (?,?,?,?,?,?)",
         [$attemptId, $studentId, $attempt['exam_db_id'], $type, $desc, $vCount]
     );
@@ -153,337 +121,668 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['record_violation'])) 
             "UPDATE exam_attempts SET status='terminated', termination_reason='Max violations exceeded', end_time=NOW() WHERE id=?",
             [$attemptId]
         );
-        calculateAndSaveResult($attemptId, $studentId, $attempt['exam_db_id'], $attempt, true);
+        calculateAndSaveResult($attemptId, $studentId, (int)$attempt['exam_db_id'], $attempt, true);
         $terminated = true;
     }
-
     echo json_encode(['success' => true, 'count' => $vCount, 'max' => $maxV, 'terminated' => $terminated]);
     exit;
 }
 
-// ============================================================
-// AJAX finish exam
-// ============================================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['finish_exam'])) {
-    header('Content-Type: application/json');
-    autoSubmitExam($attemptId, $studentId, $attempt['exam_db_id'], $attempt);
-    echo json_encode(['success' => true, 'redirect' => "result_view.php?attempt_id=$attemptId"]);
-    exit;
-}
-
-// ============================================================
-// Helper functions
-// ============================================================
-function autoSubmitExam(int $attemptId, int $studentId, int $examId, array $attempt): void {
+// ── Helper functions ─────────────────────────────────────────
+function autoSubmitExam(int $aid, int $sid, int $eid, array $a): void {
     db()->execute(
-        "UPDATE exam_attempts SET status='completed', end_time=NOW(), time_taken_seconds=TIMESTAMPDIFF(SECOND,start_time,NOW()) WHERE id=?",
-        [$attemptId]
+        "UPDATE exam_attempts SET status='completed', end_time=NOW(),
+         time_taken_seconds=TIMESTAMPDIFF(SECOND,start_time,NOW()) WHERE id=?", [$aid]
     );
-    db()->execute("UPDATE exam_schedules SET status='completed' WHERE id=?", [$attempt['schedule_id']]);
-    calculateAndSaveResult($attemptId, $studentId, $examId, $attempt, false);
+    db()->execute("UPDATE exam_schedules SET status='completed' WHERE id=?", [$a['schedule_id']]);
+    calculateAndSaveResult($aid, $sid, $eid, $a, false);
 }
 
-function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, array $attempt, bool $violated): void {
-    if (db()->fetchOne("SELECT id FROM exam_results WHERE attempt_id=?", [$attemptId])) return;
+function calculateAndSaveResult(int $aid, int $sid, int $eid, array $a, bool $violated): void {
+    if (db()->fetchOne("SELECT id FROM exam_results WHERE attempt_id=?", [$aid])) return;
 
-    $answers = db()->fetchAll("SELECT * FROM student_answers WHERE attempt_id=?", [$attemptId]);
-
+    $answers    = db()->fetchAll("SELECT * FROM student_answers WHERE attempt_id=?", [$aid]);
     $total      = count($answers);
-    $correct    = 0;
-    $incorrect  = 0;
-    $unanswered = 0;
-    $obtained   = 0;
-    $negTotal   = 0;
+    $correct    = $incorrect = $unanswered = 0;
+    $obtained   = $negTotal  = 0;
 
-    $exam       = db()->fetchOne("SELECT total_marks, passing_percentage FROM exams WHERE id=?", [$examId]);
-    $totalMarks = (float)($exam['total_marks'] ?? 100);
+    $exam       = db()->fetchOne("SELECT total_marks, passing_percentage FROM exams WHERE id=?", [$eid]);
+    $totalMarks = (float)($exam['total_marks']        ?? 100);
     $passPct    = (float)($exam['passing_percentage'] ?? 60);
 
-    foreach ($answers as $a) {
-        if (!$a['is_answered']) {
-            $unanswered++;
-        } elseif ($a['is_correct']) {
-            $correct++;
-            $obtained += (float)$a['marks_awarded'];
-        } else {
+    foreach ($answers as $an) {
+        if (!$an['is_answered']) { $unanswered++; continue; }
+        $obtained += (float)$an['marks_awarded'];
+        if ($an['is_correct']) { $correct++; }
+        else {
             $incorrect++;
-            $obtained += (float)$a['marks_awarded']; // already negative if neg marking
-            if ((float)$a['marks_awarded'] < 0) $negTotal += abs((float)$a['marks_awarded']);
+            if ((float)$an['marks_awarded'] < 0)
+                $negTotal += abs((float)$an['marks_awarded']);
         }
     }
 
     $pct    = $totalMarks > 0 ? round(($obtained / $totalMarks) * 100, 2) : 0;
     $result = (!$violated && $pct >= $passPct) ? 'PASS' : 'FAIL';
-
-    $att = db()->fetchOne("SELECT time_taken_seconds, schedule_id FROM exam_attempts WHERE id=?", [$attemptId]);
+    $att    = db()->fetchOne("SELECT time_taken_seconds, schedule_id FROM exam_attempts WHERE id=?", [$aid]);
 
     db()->execute(
         "INSERT IGNORE INTO exam_results
-         (attempt_id, student_id, exam_id, schedule_id, total_questions, attempted_questions,
-          correct_answers, incorrect_answers, unanswered, total_marks, obtained_marks,
-          negative_marks_total, percentage, passing_percentage, result, violation_terminated, time_taken_seconds)
+         (attempt_id,student_id,exam_id,schedule_id,total_questions,attempted_questions,
+          correct_answers,incorrect_answers,unanswered,total_marks,obtained_marks,
+          negative_marks_total,percentage,passing_percentage,result,violation_terminated,time_taken_seconds)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [$attemptId, $studentId, $examId, $att['schedule_id'],
+        [$aid, $sid, $eid, $att['schedule_id'],
          $total, $correct + $incorrect, $correct, $incorrect, $unanswered,
          $totalMarks, max(0, $obtained), $negTotal, $pct, $passPct, $result,
          $violated ? 1 : 0, $att['time_taken_seconds'] ?? 0]
     );
 }
 
+// ── Build per-question status array for JS ───────────────────
+$qStatuses = [];
+foreach ($questions as $q) {
+    if ($q['is_answered'] && $q['is_marked'])   $qStatuses[] = 'marked';
+    elseif ($q['is_answered'])                  $qStatuses[] = 'answered';
+    elseif ($q['is_marked'])                    $qStatuses[] = 'marked';
+    else                                        $qStatuses[] = 'unanswered';
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= sanitize($attempt['exam_name']) ?> — <?= APP_NAME ?></title>
+    <title><?= htmlspecialchars($attempt['exam_name'], ENT_QUOTES) ?> — <?= APP_NAME ?></title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="../assets/css/student.css">
     <style>
-        /* Save-state indicator */
-        .save-indicator {
-            position: fixed;
-            bottom: 1.5rem;
-            right: 1.5rem;
-            z-index: 2000;
-            padding: .5rem 1rem;
-            border-radius: 30px;
-            font-size: .82rem;
-            font-weight: 600;
-            display: none;
-            gap: .4rem;
-            align-items: center;
-            box-shadow: 0 4px 14px rgba(0,0,0,.18);
-            transition: opacity .3s;
-        }
-        .save-indicator.saving  { display: flex; background: #fff3e0; color: #e65100; border: 1px solid #ffe082; }
-        .save-indicator.saved   { display: flex; background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
-        .save-indicator.error   { display: flex; background: #ffebee; color: #b71c1c; border: 1px solid #ef9a9a; }
-        /* Nav btn cursor pointer fix */
-        .q-nav-btn { cursor: pointer; }
+    /* ══════════════════════════════════════════════════════════
+       ASSESSVUE EXAM INTERFACE
+       ══════════════════════════════════════════════════════════ */
+    :root {
+        --primary:   #1a237e;
+        --accent:    #3949ab;
+        --success:   #2e7d32;
+        --warning:   #f57f17;
+        --danger:    #c62828;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+        font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+        background: #eceff1;
+        overflow-x: hidden;
+    }
+
+    /* ── TOP BAR ──────────────────────────────────────────── */
+    .exam-topbar {
+        background: var(--primary);
+        color: #fff;
+        height: 58px;
+        padding: 0 1.25rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        position: sticky;
+        top: 0;
+        z-index: 200;
+        box-shadow: 0 3px 12px rgba(26,35,126,.4);
+    }
+    .topbar-brand {
+        font-weight: 800;
+        font-size: 1rem;
+        letter-spacing: -.3px;
+        white-space: nowrap;
+    }
+    .topbar-brand span { color: #90caf9; }
+    .topbar-sep { width: 1px; height: 24px; background: rgba(255,255,255,.2); }
+    .topbar-exam { font-size: .88rem; font-weight: 600; flex: 1; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
+    .topbar-qnum {
+        font-size: .8rem; background: rgba(255,255,255,.15);
+        padding: .25rem .8rem; border-radius: 20px; white-space: nowrap;
+    }
+    .topbar-student {
+        display: flex; align-items: center; gap: .5rem; font-size: .82rem;
+        background: rgba(255,255,255,.1); padding: .25rem .75rem .25rem .35rem;
+        border-radius: 30px;
+    }
+    .topbar-avatar {
+        width: 28px; height: 28px; border-radius: 50%; object-fit: cover;
+        border: 2px solid rgba(255,255,255,.4); flex-shrink: 0;
+        background: rgba(255,255,255,.2);
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: .75rem;
+    }
+    .topbar-avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+    .exam-timer {
+        font-family: 'Courier New', monospace;
+        font-size: 1.2rem;
+        font-weight: 700;
+        background: rgba(255,255,255,.15);
+        padding: .3rem .9rem;
+        border-radius: 8px;
+        min-width: 105px;
+        text-align: center;
+        white-space: nowrap;
+        transition: background .3s, color .3s;
+    }
+    .exam-timer.warning  { background: rgba(245,127,23,.3);  color: #ffe57f; }
+    .exam-timer.critical { background: rgba(198,40,40,.5);   color: #ff8a80;
+                           animation: timerPulse 1s infinite; }
+    @keyframes timerPulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+
+    /* ── LAYOUT ───────────────────────────────────────────── */
+    .exam-layout {
+        display: flex;
+        gap: 1.25rem;
+        padding: 1.25rem;
+        max-width: 1280px;
+        margin: 0 auto;
+        align-items: flex-start;
+    }
+    .exam-main    { flex: 1; min-width: 0; }
+    .exam-sidebar { width: 270px; flex-shrink: 0; position: sticky; top: 70px; }
+
+    /* ── QUESTION CARD ────────────────────────────────────── */
+    .question-card {
+        background: #fff;
+        border-radius: 16px;
+        box-shadow: 0 4px 20px rgba(0,0,0,.10);
+        overflow: hidden;
+    }
+    .question-card-header {
+        background: linear-gradient(135deg, #e8eaf6, #f3f4fb);
+        padding: .9rem 1.5rem;
+        border-bottom: 1px solid #e0e0f0;
+        display: flex;
+        align-items: center;
+        gap: .75rem;
+    }
+    .q-number-badge {
+        background: var(--accent); color: #fff;
+        font-size: .78rem; font-weight: 700;
+        padding: .25rem .75rem; border-radius: 20px;
+        white-space: nowrap;
+    }
+    .q-mark-badge {
+        background: #fff8e1; color: #f57f17;
+        border: 1px solid #ffe082;
+        font-size: .75rem; font-weight: 700;
+        padding: .2rem .6rem; border-radius: 20px;
+        display: flex; align-items: center; gap: .3rem;
+    }
+    .question-card-body { padding: 1.5rem; }
+    .question-text {
+        font-size: 1.05rem;
+        font-weight: 500;
+        color: #263238;
+        line-height: 1.65;
+        margin-bottom: 1.5rem;
+    }
+
+    /* ── OPTIONS ──────────────────────────────────────────── */
+    .option-label {
+        display: flex;
+        align-items: center;
+        gap: .85rem;
+        padding: 1rem 1.25rem;
+        border: 2px solid #e8e8f0;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: border-color .15s, background .15s, transform .1s;
+        margin-bottom: .75rem;
+        background: #fafafa;
+        user-select: none;
+    }
+    .option-label:hover {
+        border-color: var(--accent);
+        background: #f0f1fc;
+        transform: translateX(3px);
+    }
+    .option-label.selected {
+        border-color: var(--accent);
+        background: #e8eaf6;
+        transform: translateX(3px);
+    }
+    .option-label input[type=radio] { display: none; }
+    .option-key {
+        width: 36px; height: 36px; border-radius: 50%;
+        background: #e8eaf6; color: var(--accent);
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: .88rem; flex-shrink: 0;
+        transition: background .15s, color .15s;
+    }
+    .option-label.selected .option-key,
+    .option-label:hover .option-key {
+        background: var(--accent); color: #fff;
+    }
+    .option-text { flex: 1; font-size: .95rem; color: #37474f; line-height: 1.5; }
+
+    /* ── ACTION BUTTONS ───────────────────────────────────── */
+    .exam-actions {
+        display: flex; gap: .75rem; flex-wrap: wrap;
+        padding: 1rem 1.5rem;
+        border-top: 1px solid #f0f0f0;
+        background: #f9f9fc;
+        border-radius: 0 0 16px 16px;
+    }
+    .btn-exam { border-radius: 10px; padding: .55rem 1.35rem; font-weight: 700; font-size: .88rem; }
+    .btn-exam:disabled { opacity: .6; }
+
+    /* ── SIDEBAR ──────────────────────────────────────────── */
+    .sidebar-card {
+        background: #fff;
+        border-radius: 14px;
+        box-shadow: 0 4px 20px rgba(0,0,0,.09);
+        overflow: hidden;
+        margin-bottom: 1rem;
+    }
+    .sidebar-card-header {
+        background: #f5f6fb;
+        padding: .65rem 1rem;
+        font-size: .82rem;
+        font-weight: 700;
+        color: var(--primary);
+        border-bottom: 1px solid #ebebf5;
+        display: flex; align-items: center; gap: .4rem;
+    }
+    .sidebar-card-body { padding: .85rem 1rem; }
+
+    /* ── QUESTION NAV GRID ────────────────────────────────── */
+    .q-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+    .q-btn {
+        width: 34px; height: 34px;
+        border-radius: 7px;
+        border: 2px solid #e0e0e0;
+        background: #fafafa;
+        color: #90a4ae;
+        font-size: .78rem;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all .15s;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+    }
+    .q-btn:hover:not(:disabled)  { border-color: var(--accent); color: var(--accent); background: #e8eaf6; }
+    .q-btn.answered  { background: #e8f5e9; border-color: #66bb6a; color: #2e7d32; }
+    .q-btn.marked    { background: #fff8e1; border-color: #ffd54f; color: #e65100; }
+    .q-btn.current   { background: var(--primary); border-color: var(--primary); color: #fff !important; }
+    .q-btn.unanswered { background: #fafafa; border-color: #e0e0e0; color: #9e9e9e; }
+
+    /* ── LEGEND ───────────────────────────────────────────── */
+    .legend-grid { display: flex; flex-direction: column; gap: .35rem; }
+    .legend-row  {
+        display: flex; align-items: center; gap: .5rem;
+        font-size: .78rem; color: #546e7a;
+    }
+    .legend-swatch {
+        width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0;
+    }
+    .legend-count { margin-left: auto; font-weight: 700; color: #37474f; }
+
+    /* ── SUMMARY STATS ────────────────────────────────────── */
+    .stat-pill {
+        flex: 1; text-align: center; padding: .65rem .5rem;
+        border-radius: 10px;
+    }
+    .stat-pill-val { font-size: 1.35rem; font-weight: 800; line-height: 1; }
+    .stat-pill-lbl { font-size: .7rem; font-weight: 500; margin-top: .15rem; }
+
+    /* ── SAVE TOAST ───────────────────────────────────────── */
+    .save-toast {
+        position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%);
+        z-index: 9999;
+        padding: .5rem 1.25rem;
+        border-radius: 30px;
+        font-size: .82rem;
+        font-weight: 700;
+        display: none;
+        align-items: center;
+        gap: .5rem;
+        box-shadow: 0 6px 24px rgba(0,0,0,.18);
+        white-space: nowrap;
+        pointer-events: none;
+        transition: opacity .2s;
+    }
+    .save-toast.show     { display: flex; }
+    .save-toast.saving   { background: #1a237e; color: #fff; }
+    .save-toast.saved    { background: #2e7d32; color: #fff; }
+    .save-toast.error    { background: #c62828; color: #fff; }
+
+    /* ── OVERLAYS ─────────────────────────────────────────── */
+    .full-overlay {
+        position: fixed; inset: 0; background: rgba(0,0,0,.8);
+        z-index: 9998; display: none;
+        align-items: center; justify-content: center;
+    }
+    .full-overlay.show { display: flex; }
+    .overlay-box {
+        background: #fff; border-radius: 20px;
+        padding: 2.5rem; max-width: 460px; width: 90%;
+        text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,.3);
+    }
+    .overlay-box.danger-top { border-top: 6px solid var(--danger); }
+    .overlay-icon { font-size: 3rem; margin-bottom: 1rem; }
+
+    /* ── RESPONSIVE ───────────────────────────────────────── */
+    @media (max-width: 900px) {
+        .exam-layout { flex-direction: column; padding: .75rem; }
+        .exam-sidebar { width: 100%; position: static; }
+    }
+    @media (max-width: 540px) {
+        .topbar-student { display: none; }
+        .topbar-exam    { font-size: .78rem; }
+        .exam-timer     { font-size: 1rem; min-width: 90px; padding: .25rem .6rem; }
+    }
     </style>
 </head>
-<body class="exam-mode">
+<body>
 
-<!-- Save Indicator Toast -->
-<div class="save-indicator" id="saveIndicator">
-    <i class="fas fa-circle-notch fa-spin" id="saveIcon"></i>
-    <span id="saveText">Saving...</span>
+<!-- ═══════════════════ SAVE TOAST ═══════════════════ -->
+<div class="save-toast" id="saveToast">
+    <i class="fas fa-circle-notch fa-spin" id="saveToastIcon"></i>
+    <span id="saveToastText">Saving…</span>
 </div>
 
-<!-- Exam Top Bar -->
-<div class="exam-topbar">
-    <div class="exam-title">
-        <i class="fas fa-graduation-cap me-2"></i><?= sanitize($attempt['exam_name']) ?>
-    </div>
-    <div class="exam-student-info d-none d-md-block">
-        <i class="fas fa-user me-1"></i><?= sanitize($attempt['full_name']) ?>
-    </div>
-    <div class="exam-qnum">
-        Q <?= $qNum ?> / <?= $totalQ ?>
-    </div>
-    <div class="exam-timer" id="examTimer">
-        <?= gmdate('H:i:s', $remainSeconds) ?>
-    </div>
-</div>
-
-<!-- Violation Overlay -->
-<div class="violation-overlay d-none" id="violationOverlay">
-    <div class="violation-box">
-        <div style="font-size:3rem" class="text-danger mb-3"><i class="fas fa-exclamation-triangle"></i></div>
-        <h4 class="text-danger fw-bold">Examination Rule Violation Detected</h4>
-        <p id="violationMsg">You have attempted to leave the examination screen.</p>
-        <div class="alert alert-warning py-2">
-            <strong>Violation <span id="vCount">1</span> of <?= $attempt['max_violations'] ?: '∞' ?></strong>
+<!-- ═══════════════════ VIOLATION OVERLAY ═══════════ -->
+<div class="full-overlay" id="violationOverlay">
+    <div class="overlay-box danger-top">
+        <div class="overlay-icon text-danger"><i class="fas fa-exclamation-triangle"></i></div>
+        <h4 class="fw-bold text-danger mb-2">Rule Violation Detected</h4>
+        <p id="violationMsg" class="text-muted mb-3">You have attempted to leave the examination screen.</p>
+        <div class="alert alert-warning py-2 mb-3">
+            <strong>Violation <span id="vCount"><?= $violations ?></span>
+            of <?= $attempt['max_violations'] ?: '∞' ?></strong>
         </div>
-        <p class="text-muted small">Return to examination immediately. Further violations may result in exam termination.</p>
-        <button class="btn btn-danger px-4" onclick="dismissViolation()">
-            <i class="fas fa-arrow-left me-2"></i>Return to Examination
+        <p class="text-muted small mb-3">Return immediately. Further violations may terminate the exam.</p>
+        <button class="btn btn-danger btn-exam px-5" onclick="dismissViolation()">
+            <i class="fas fa-arrow-left me-2"></i>Return to Exam
         </button>
     </div>
 </div>
 
-<!-- Terminated Overlay -->
-<div class="violation-overlay d-none" id="terminatedOverlay">
-    <div class="violation-box">
-        <div style="font-size:3rem" class="text-danger mb-3"><i class="fas fa-ban"></i></div>
-        <h4 class="text-danger fw-bold">Examination Terminated</h4>
-        <p>You have exceeded the maximum allowed violations. Your examination has been automatically terminated and marked as <strong>FAIL</strong>.</p>
-        <a href="result_view.php?attempt_id=<?= $attemptId ?>" class="btn btn-danger px-4 mt-2">View Result</a>
+<!-- ═══════════════════ TERMINATED OVERLAY ═════════ -->
+<div class="full-overlay" id="terminatedOverlay">
+    <div class="overlay-box danger-top">
+        <div class="overlay-icon text-danger"><i class="fas fa-ban"></i></div>
+        <h4 class="fw-bold text-danger mb-2">Examination Terminated</h4>
+        <p class="text-muted mb-4">You exceeded the maximum violations. The exam is marked <strong>FAIL</strong>.</p>
+        <a href="result_view.php?attempt_id=<?= $attemptId ?>" class="btn btn-danger btn-exam px-5">
+            <i class="fas fa-chart-bar me-2"></i>View Result
+        </a>
     </div>
 </div>
 
+<!-- ═══════════════════ TOPBAR ═══════════════════════ -->
+<div class="exam-topbar">
+    <div class="topbar-brand">Assess<span>VUE</span></div>
+    <div class="topbar-sep"></div>
+    <div class="topbar-exam"><?= htmlspecialchars($attempt['exam_name'], ENT_QUOTES) ?></div>
+    <div class="topbar-qnum">Q <?= $qNum ?> / <?= $totalQ ?></div>
+    <div class="topbar-student">
+        <div class="topbar-avatar">
+            <?php if ($attempt['profile_picture']): ?>
+            <img src="serve_file.php?type=profile" alt="<?= htmlspecialchars($attempt['full_name'], ENT_QUOTES) ?>"
+                 onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+            <span style="display:none;width:100%;height:100%;border-radius:50%;background:rgba(255,255,255,.2);
+                         align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:.75rem;">
+                <?= strtoupper(substr($attempt['full_name'],0,1)) ?>
+            </span>
+            <?php else: ?>
+            <span style="display:flex;width:100%;height:100%;border-radius:50%;background:rgba(255,255,255,.2);
+                         align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:.75rem;">
+                <?= strtoupper(substr($attempt['full_name'],0,1)) ?>
+            </span>
+            <?php endif; ?>
+        </div>
+        <div>
+            <div style="font-size:.8rem;font-weight:700;line-height:1.2;"><?= htmlspecialchars($attempt['full_name'], ENT_QUOTES) ?></div>
+            <div style="font-size:.68rem;opacity:.7;"><?= htmlspecialchars($attempt['stu_code'], ENT_QUOTES) ?></div>
+        </div>
+    </div>
+    <div class="exam-timer" id="examTimer"><?= gmdate('H:i:s', $remainSeconds) ?></div>
+</div>
+
+<!-- ═══════════════════ EXAM LAYOUT ══════════════════ -->
 <div class="exam-layout">
-    <!-- Main Question Panel -->
+
+    <!-- ── MAIN QUESTION PANEL ─────────────────────── -->
     <div class="exam-main">
         <?php if ($currentQ): ?>
-        <div class="question-box">
-            <div class="question-label">
-                Question <?= $qNum ?> of <?= $totalQ ?>
-                <?php if ($currentQ['is_marked']): ?>
-                <span class="badge bg-warning text-dark ms-2"><i class="fas fa-bookmark me-1"></i>Marked for Review</span>
-                <?php endif; ?>
-            </div>
-            <div class="question-text"><?= htmlspecialchars($currentQ['question_text']) ?></div>
+        <div class="question-card">
 
-            <div id="optionsContainer">
+            <!-- Header -->
+            <div class="question-card-header">
+                <span class="q-number-badge">Question <?= $qNum ?> of <?= $totalQ ?></span>
+                <?php if ($currentQ['is_marked']): ?>
+                <span class="q-mark-badge"><i class="fas fa-bookmark"></i>Marked for Review</span>
+                <?php else: ?>
+                <span class="q-mark-badge" id="markBadge" style="display:none!important">
+                    <i class="fas fa-bookmark"></i>Marked for Review
+                </span>
+                <?php endif; ?>
+                <span class="ms-auto" style="font-size:.78rem;color:#78909c;">
+                    <i class="fas fa-clock me-1"></i>PKT: <?= date('h:i A') ?>
+                </span>
+            </div>
+
+            <!-- Question Body -->
+            <div class="question-card-body">
+                <div class="question-text"><?= nl2br(htmlspecialchars($currentQ['question_text'], ENT_QUOTES)) ?></div>
+
+                <div id="optionsContainer">
                 <?php foreach (['A','B','C','D'] as $opt):
                     $key   = 'option_' . strtolower($opt);
-                    $isSel = $currentQ['selected_option'] === $opt;
+                    $optText = trim($currentQ[$key] ?? '');
+                    if ($optText === '') continue;
+                    $isSel = ($currentQ['selected_option'] === $opt);
                 ?>
-                <label class="option-label <?= $isSel ? 'selected' : '' ?>" data-option="<?= $opt ?>"
+                <label class="option-label <?= $isSel ? 'selected' : '' ?>"
+                       data-option="<?= $opt ?>"
                        onclick="selectAnswer('<?= $opt ?>', this)">
                     <input type="radio" name="answer" value="<?= $opt ?>" <?= $isSel ? 'checked' : '' ?>>
-                    <span class="option-badge"><?= $opt ?></span>
-                    <span class="option-text"><?= htmlspecialchars($currentQ[$key] ?? '') ?></span>
+                    <span class="option-key"><?= $opt ?></span>
+                    <span class="option-text"><?= htmlspecialchars($optText, ENT_QUOTES) ?></span>
                 </label>
                 <?php endforeach; ?>
+                </div>
             </div>
 
-            <!-- Exam action buttons — all JS-driven for safe async save -->
-            <div class="exam-actions mt-3">
+            <!-- Actions -->
+            <div class="exam-actions">
                 <?php if ($qNum > 1): ?>
-                <button type="button" class="btn btn-outline-secondary" onclick="goToQuestion(<?= $qNum-1 ?>)">
+                <button type="button" class="btn btn-outline-secondary btn-exam"
+                        id="btnPrev" onclick="goToQuestion(<?= $qNum - 1 ?>)">
                     <i class="fas fa-arrow-left me-1"></i>Previous
                 </button>
                 <?php endif; ?>
 
-                <button type="button"
-                        class="btn <?= $currentQ['is_marked'] ? 'btn-warning' : 'btn-outline-warning' ?>"
-                        id="markBtn"
+                <button type="button" id="markBtn"
+                        class="btn btn-exam <?= $currentQ['is_marked'] ? 'btn-warning' : 'btn-outline-warning' ?>"
                         onclick="toggleMark()">
                     <i class="fas fa-bookmark me-1"></i>
-                    <?= $currentQ['is_marked'] ? 'Unmark' : 'Mark for Review' ?>
+                    <span id="markBtnText"><?= $currentQ['is_marked'] ? 'Unmark' : 'Mark for Review' ?></span>
                 </button>
 
-                <?php if ($qNum < $totalQ): ?>
-                <button type="button" class="btn btn-primary" onclick="goToQuestion(<?= $qNum+1 ?>)">
-                    Next <i class="fas fa-arrow-right ms-1"></i>
-                </button>
-                <?php else: ?>
-                <button type="button" class="btn btn-success" onclick="showFinishModal()">
-                    <i class="fas fa-flag-checkered me-1"></i>Finish Exam
-                </button>
-                <?php endif; ?>
+                <div class="ms-auto d-flex gap-2">
+                    <?php if ($qNum < $totalQ): ?>
+                    <button type="button" class="btn btn-primary btn-exam"
+                            id="btnNext" onclick="goToQuestion(<?= $qNum + 1 ?>)">
+                        Next <i class="fas fa-arrow-right ms-1"></i>
+                    </button>
+                    <?php else: ?>
+                    <button type="button" class="btn btn-success btn-exam" onclick="showFinishModal()">
+                        <i class="fas fa-flag-checkered me-1"></i>Finish Exam
+                    </button>
+                    <?php endif; ?>
 
-                <button type="button" class="btn btn-outline-danger ms-auto d-none d-sm-block"
-                        onclick="showFinishModal()">
-                    <i class="fas fa-stop me-1"></i>End Exam
-                </button>
+                    <button type="button" class="btn btn-outline-danger btn-exam d-none d-sm-flex"
+                            onclick="showFinishModal()">
+                        <i class="fas fa-stop me-1"></i>End
+                    </button>
+                </div>
             </div>
         </div>
         <?php endif; ?>
     </div>
 
-    <!-- Navigation Panel -->
-    <div class="exam-nav-panel">
-        <div class="card mb-3">
-            <div class="card-header py-2"><i class="fas fa-th me-2"></i>Questions</div>
-            <div class="card-body">
-                <div class="d-flex flex-wrap gap-1 mb-3" id="qNavGrid">
-                    <?php foreach ($questions as $i => $q): ?>
-                    <?php
-                        $n   = $i + 1;
-                        $cls = 'unanswered';
-                        if ($n === $qNum)                              $cls = 'current';
-                        elseif ($q['is_answered'] && $q['is_marked']) $cls = 'marked';
-                        elseif ($q['is_answered'])                    $cls = 'answered';
-                        elseif ($q['is_marked'])                      $cls = 'marked';
-                    ?>
-                    <button type="button"
-                            class="q-nav-btn <?= $cls ?>"
-                            onclick="goToQuestion(<?= $n ?>)"><?= $n ?></button>
-                    <?php endforeach; ?>
+    <!-- ── SIDEBAR ─────────────────────────────────── -->
+    <div class="exam-sidebar">
+
+        <!-- Question Navigator -->
+        <div class="sidebar-card">
+            <div class="sidebar-card-header">
+                <i class="fas fa-th-large"></i> Question Navigator
+            </div>
+            <div class="sidebar-card-body">
+                <div class="q-grid mb-3" id="qGrid">
+                <?php foreach ($questions as $i => $q):
+                    $n   = $i + 1;
+                    $cls = $qStatuses[$i];
+                    if ($n === $qNum) $cls = 'current';
+                ?>
+                <button type="button"
+                        class="q-btn <?= $cls ?>"
+                        id="qbtn<?= $n ?>"
+                        onclick="goToQuestion(<?= $n ?>)"><?= $n ?></button>
+                <?php endforeach; ?>
                 </div>
 
                 <!-- Legend -->
-                <div class="nav-legend">
-                    <div class="legend-item">
-                        <div class="legend-dot" style="background:#e8f5e9;border:1px solid #43a047;border-radius:3px"></div>
-                        <span>Answered (<span id="legendAnswered"><?= $answered ?></span>)</span>
+                <div class="legend-grid">
+                    <div class="legend-row">
+                        <div class="legend-swatch" style="background:#e8f5e9;border:2px solid #66bb6a;"></div>
+                        <span>Answered</span>
+                        <span class="legend-count" id="legAnswered"><?= $answered ?></span>
                     </div>
-                    <div class="legend-item">
-                        <div class="legend-dot" style="background:#fff3e0;border:1px solid #f9a825;border-radius:3px"></div>
-                        <span>Marked (<span id="legendMarked"><?= $marked ?></span>)</span>
+                    <div class="legend-row">
+                        <div class="legend-swatch" style="background:#fff8e1;border:2px solid #ffd54f;"></div>
+                        <span>Marked</span>
+                        <span class="legend-count" id="legMarked"><?= $marked ?></span>
                     </div>
-                    <div class="legend-item">
-                        <div class="legend-dot" style="background:#fafafa;border:1px solid #e0e0e0;border-radius:3px"></div>
-                        <span>Not Answered (<span id="legendRemaining"><?= $totalQ - $answered ?></span>)</span>
+                    <div class="legend-row">
+                        <div class="legend-swatch" style="background:#fafafa;border:2px solid #e0e0e0;"></div>
+                        <span>Unanswered</span>
+                        <span class="legend-count" id="legUnanswered"><?= $totalQ - $answered ?></span>
                     </div>
-                    <div class="legend-item">
-                        <div class="legend-dot" style="background:#3949ab;border:1px solid #1a237e;border-radius:3px"></div>
+                    <div class="legend-row">
+                        <div class="legend-swatch" style="background:#1a237e;border:2px solid #1a237e;border-radius:4px;"></div>
                         <span>Current</span>
+                        <span class="legend-count">Q<?= $qNum ?></span>
                     </div>
                 </div>
             </div>
         </div>
 
         <!-- Summary -->
-        <div class="card">
-            <div class="card-body py-2">
-                <div class="row g-1 text-center">
-                    <div class="col-6">
-                        <div class="p-2 bg-success bg-opacity-10 rounded">
-                            <div class="fw-bold text-success" id="summaryAnswered"><?= $answered ?></div>
-                            <small class="text-muted">Answered</small>
-                        </div>
+        <div class="sidebar-card">
+            <div class="sidebar-card-header">
+                <i class="fas fa-chart-bar"></i> Summary
+            </div>
+            <div class="sidebar-card-body">
+                <div class="d-flex gap-2 mb-3">
+                    <div class="stat-pill" style="background:#e8f5e9;">
+                        <div class="stat-pill-val text-success" id="sumAnswered"><?= $answered ?></div>
+                        <div class="stat-pill-lbl text-success">Done</div>
                     </div>
-                    <div class="col-6">
-                        <div class="p-2 bg-secondary bg-opacity-10 rounded">
-                            <div class="fw-bold text-secondary" id="summaryRemaining"><?= $totalQ - $answered ?></div>
-                            <small class="text-muted">Remaining</small>
-                        </div>
+                    <div class="stat-pill" style="background:#fff8e1;">
+                        <div class="stat-pill-val text-warning" id="sumMarked"><?= $marked ?></div>
+                        <div class="stat-pill-lbl text-warning">Review</div>
+                    </div>
+                    <div class="stat-pill" style="background:#f5f5f5;">
+                        <div class="stat-pill-val text-secondary" id="sumLeft"><?= $totalQ - $answered ?></div>
+                        <div class="stat-pill-lbl text-secondary">Left</div>
                     </div>
                 </div>
-                <button class="btn btn-success btn-sm w-100 mt-2" onclick="showFinishModal()">
-                    <i class="fas fa-flag-checkered me-1"></i>Finish Examination
+
+                <!-- Progress bar -->
+                <div style="background:#eceff1;border-radius:8px;height:8px;overflow:hidden;margin-bottom:.75rem;">
+                    <div id="progressBar"
+                         style="height:100%;background:linear-gradient(90deg,#43a047,#66bb6a);border-radius:8px;
+                                transition:width .4s;width:<?= $totalQ > 0 ? round($answered/$totalQ*100) : 0 ?>%;">
+                    </div>
+                </div>
+                <div style="font-size:.75rem;color:#90a4ae;text-align:center;margin-bottom:.75rem;">
+                    <span id="progressPct"><?= $totalQ > 0 ? round($answered/$totalQ*100) : 0 ?></span>% complete
+                </div>
+
+                <button class="btn btn-success btn-exam w-100" onclick="showFinishModal()">
+                    <i class="fas fa-flag-checkered me-1"></i>Submit Exam
                 </button>
             </div>
         </div>
-    </div>
-</div>
 
-<!-- Finish Modal -->
+        <!-- Violation Counter -->
+        <?php if ((int)$attempt['max_violations'] > 0): ?>
+        <div class="sidebar-card">
+            <div class="sidebar-card-header">
+                <i class="fas fa-shield-alt"></i> Integrity Monitor
+            </div>
+            <div class="sidebar-card-body">
+                <div class="d-flex align-items-center gap-2">
+                    <div style="flex:1;">
+                        <div style="font-size:.78rem;color:#78909c;">Violations</div>
+                        <div style="font-size:1.2rem;font-weight:800;color:<?= $violations > 0 ? '#c62828' : '#2e7d32'; ?>;">
+                            <span id="violCount"><?= $violations ?></span> / <?= $attempt['max_violations'] ?>
+                        </div>
+                    </div>
+                    <div style="font-size:1.75rem;color:<?= $violations > 0 ? '#ef5350' : '#43a047'; ?>;">
+                        <i class="fas fa-<?= $violations > 0 ? 'exclamation-triangle' : 'check-shield' ?>"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+    </div><!-- /sidebar -->
+</div><!-- /exam-layout -->
+
+<!-- ═══════════════════ FINISH MODAL ════════════════ -->
 <div class="modal fade" id="finishModal" tabindex="-1" data-bs-backdrop="static">
     <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header bg-success text-white">
-                <h5 class="modal-title"><i class="fas fa-flag-checkered me-2"></i>Submit Examination</h5>
+        <div class="modal-content" style="border-radius:16px;overflow:hidden;">
+            <div class="modal-header" style="background:linear-gradient(135deg,#1b5e20,#2e7d32);color:#fff;">
+                <h5 class="modal-title fw-bold">
+                    <i class="fas fa-flag-checkered me-2"></i>Submit Examination
+                </h5>
             </div>
             <div class="modal-body">
                 <p class="fw-semibold mb-3">Are you sure you want to submit your examination?</p>
-                <div class="row g-2 text-center">
+                <div class="row g-2 text-center mb-3">
                     <div class="col-4">
-                        <div class="p-2 bg-primary bg-opacity-10 rounded">
-                            <div class="fw-bold text-primary"><?= $totalQ ?></div>
-                            <small>Total</small>
+                        <div class="p-2 rounded" style="background:#e3f2fd;">
+                            <div class="fw-bold text-primary fs-5"><?= $totalQ ?></div>
+                            <small class="text-muted">Total</small>
                         </div>
                     </div>
                     <div class="col-4">
-                        <div class="p-2 bg-success bg-opacity-10 rounded">
-                            <div class="fw-bold text-success" id="finalAnswered"><?= $answered ?></div>
-                            <small>Answered</small>
+                        <div class="p-2 rounded" style="background:#e8f5e9;">
+                            <div class="fw-bold text-success fs-5" id="modalAnswered"><?= $answered ?></div>
+                            <small class="text-muted">Answered</small>
                         </div>
                     </div>
                     <div class="col-4">
-                        <div class="p-2 bg-secondary bg-opacity-10 rounded">
-                            <div class="fw-bold text-secondary" id="finalUnanswered"><?= $totalQ - $answered ?></div>
-                            <small>Unanswered</small>
+                        <div class="p-2 rounded" style="background:#fff8e1;">
+                            <div class="fw-bold text-warning fs-5" id="modalUnanswered"><?= $totalQ - $answered ?></div>
+                            <small class="text-muted">Unanswered</small>
                         </div>
                     </div>
                 </div>
-                <div class="alert alert-warning mt-3 mb-0 py-2">
-                    <small><i class="fas fa-exclamation-triangle me-1"></i>
-                    Once submitted, you cannot modify your answers.</small>
+                <div class="alert alert-warning py-2 mb-0 small">
+                    <i class="fas fa-info-circle me-1"></i>
+                    Once submitted you cannot change your answers.
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">
-                    <i class="fas fa-arrow-left me-1"></i>Cancel (Continue Exam)
+                <button type="button" class="btn btn-outline-secondary btn-exam" data-bs-dismiss="modal">
+                    <i class="fas fa-arrow-left me-1"></i>Continue Exam
                 </button>
-                <button type="button" class="btn btn-success" id="confirmSubmitBtn" onclick="submitExam()">
-                    <i class="fas fa-check me-2"></i>Submit Examination
+                <button type="button" class="btn btn-success btn-exam" id="confirmSubmitBtn" onclick="submitExam()">
+                    <i class="fas fa-check me-2"></i>Submit Now
                 </button>
             </div>
         </div>
@@ -492,251 +791,244 @@ function calculateAndSaveResult(int $attemptId, int $studentId, int $examId, arr
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-// ============================================================
-// Constants from PHP
-// ============================================================
-const ATTEMPT_ID     = <?= $attemptId ?>;
-const CURRENT_Q      = <?= $qNum ?>;
-const CURRENT_Q_ID   = <?= $currentQ ? $currentQ['question_id'] : 0 ?>;
-const TOTAL_Q        = <?= $totalQ ?>;
-const REMAIN_SECONDS = <?= $remainSeconds ?>;
-const MAX_VIOLATIONS = <?= (int)$attempt['max_violations'] ?>;
-const EXAM_BASE_URL  = 'exam.php';
+/* ============================================================
+   ASSESSVUE EXAM ENGINE
+   ============================================================ */
 
-let violationCount  = <?= $violations ?>;
-let examSubmitted   = false;
+// ── Constants (from PHP) ─────────────────────────────────────
+const ATTEMPT_ID      = <?= $attemptId ?>;
+const CURRENT_Q       = <?= $qNum ?>;
+const CURRENT_QID     = <?= $currentQ ? (int)$currentQ['question_id'] : 0 ?>;
+const TOTAL_Q         = <?= $totalQ ?>;
+const REMAIN_SECS_PHP = <?= $remainSeconds ?>;
+const MAX_VIOLATIONS  = <?= (int)$attempt['max_violations'] ?>;
+const SAVE_URL        = 'save_answer.php';   // dedicated save endpoint
+const EXAM_URL        = 'exam.php';
+
+// ── State ────────────────────────────────────────────────────
+let violCount       = <?= $violations ?>;
+let examDone        = false;
 let selectedAnswer  = <?= json_encode($currentQ ? ($currentQ['selected_option'] ?? '') : '') ?>;
-let isMarked        = <?= $currentQ ? ($currentQ['is_marked'] ? 'true' : 'false') : 'false' ?>;
-let saveInProgress  = false;
-let pendingSave     = false;  // flag: need to save before navigating
+let isMarked        = <?= ($currentQ && $currentQ['is_marked']) ? 'true' : 'false' ?>;
 let answeredCount   = <?= $answered ?>;
+let markedCount     = <?= $marked ?>;
+let saving          = false;
+let saveQueue       = null;   // latest pending save params
+let navLocked       = false;  // prevents double-nav during save
 
-// ============================================================
-// TIMER
-// ============================================================
-let remainSecs = REMAIN_SECONDS;
+// Question status tracker (synced to server state on load)
+const qStatus = <?= json_encode($qStatuses) ?>;
+
+// ── TIMER ────────────────────────────────────────────────────
+let remainSecs = REMAIN_SECS_PHP;
 const timerEl  = document.getElementById('examTimer');
 
-function updateTimer() {
+(function tick() {
     if (remainSecs <= 0) {
         timerEl.textContent = '00:00:00';
-        if (!examSubmitted) { examSubmitted = true; submitExam(true); }
+        if (!examDone) { examDone = true; submitExam(true); }
         return;
     }
     const h = Math.floor(remainSecs / 3600);
     const m = Math.floor((remainSecs % 3600) / 60);
     const s = remainSecs % 60;
-    timerEl.textContent =
-        `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-
-    if (remainSecs <= 60)       timerEl.className = 'exam-timer critical';
-    else if (remainSecs <= 300) timerEl.className = 'exam-timer warning';
-
+    timerEl.textContent = `${pad(h)}:${pad(m)}:${pad(s)}`;
+    timerEl.className = 'exam-timer' +
+        (remainSecs <= 60 ? ' critical' : remainSecs <= 300 ? ' warning' : '');
     remainSecs--;
-    setTimeout(updateTimer, 1000);
-}
-updateTimer();
+    setTimeout(tick, 1000);
+})();
 
-// ============================================================
-// SAVE INDICATOR
-// ============================================================
-function showSaveIndicator(state) {  // 'saving' | 'saved' | 'error'
-    const el   = document.getElementById('saveIndicator');
-    const icon = document.getElementById('saveIcon');
-    const txt  = document.getElementById('saveText');
-    el.className = 'save-indicator ' + state;
-    if (state === 'saving') {
-        icon.className = 'fas fa-circle-notch fa-spin';
-        txt.textContent = 'Saving answer…';
-    } else if (state === 'saved') {
-        icon.className = 'fas fa-check-circle';
-        txt.textContent = 'Answer saved!';
-        setTimeout(() => { el.className = 'save-indicator'; }, 1800);
-    } else {
-        icon.className = 'fas fa-exclamation-circle';
-        txt.textContent = 'Save failed — retrying…';
+function pad(n) { return String(n).padStart(2,'0'); }
+
+// ── TOAST ────────────────────────────────────────────────────
+let toastTimer = null;
+function showToast(state, msg) {  // state: 'saving'|'saved'|'error'
+    clearTimeout(toastTimer);
+    const el   = document.getElementById('saveToast');
+    const icon = document.getElementById('saveToastIcon');
+    const txt  = document.getElementById('saveToastText');
+    el.className = 'save-toast show ' + state;
+    icon.className = state === 'saving' ? 'fas fa-circle-notch fa-spin'
+                   : state === 'saved'  ? 'fas fa-check-circle'
+                   : 'fas fa-exclamation-circle';
+    txt.textContent = msg;
+    if (state !== 'saving') {
+        toastTimer = setTimeout(() => { el.className = 'save-toast'; }, 2000);
     }
 }
 
-// ============================================================
-// CORE SAVE FUNCTION — returns Promise<bool>
-// ============================================================
-async function saveAnswerAsync(answer, mark) {
-    if (!CURRENT_Q_ID) return true;
-    saveInProgress = true;
-    showSaveIndicator('saving');
-
+// ── SAVE ANSWER (dedicated endpoint) ────────────────────────
+async function doSave(answer, mark, qid, qNum) {
     const fd = new FormData();
-    fd.append('ajax_save',   '1');
-    fd.append('question_id', CURRENT_Q_ID);
+    fd.append('attempt_id',  ATTEMPT_ID);
+    fd.append('question_id', qid);
     fd.append('answer',      answer ?? '');
     fd.append('mark',        mark ? '1' : '0');
+    fd.append('q_num',       qNum);
 
-    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+    const resp = await fetch(SAVE_URL, { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return await resp.json();
+}
 
+async function saveAnswerAsync() {
+    if (!CURRENT_QID || examDone) return true;
+    showToast('saving', 'Saving answer…');
+    saving = true;
     try {
-        const res  = await fetch(url, { method: 'POST', body: fd });
-        const data = await res.json();
-        saveInProgress = false;
+        const data = await doSave(selectedAnswer || '', isMarked, CURRENT_QID, CURRENT_Q);
+        saving = false;
         if (data.success) {
-            showSaveIndicator('saved');
+            showToast('saved', 'Answer saved ✓');
             return true;
         }
-        showSaveIndicator('error');
+        showToast('error', 'Save failed — retrying…');
+        // one retry
+        try {
+            const r2 = await doSave(selectedAnswer || '', isMarked, CURRENT_QID, CURRENT_Q);
+            if (r2.success) { showToast('saved', 'Saved ✓'); return true; }
+        } catch {}
+        showToast('error', 'Could not save — check connection');
         return false;
     } catch (e) {
-        saveInProgress = false;
-        showSaveIndicator('error');
+        saving = false;
+        showToast('error', 'Save failed — retrying…');
+        try {
+            await new Promise(r => setTimeout(r, 800));
+            const r2 = await doSave(selectedAnswer || '', isMarked, CURRENT_QID, CURRENT_Q);
+            if (r2.success) { showToast('saved', 'Saved ✓'); return true; }
+        } catch {}
+        showToast('error', 'Could not save');
         return false;
     }
 }
 
-// ============================================================
-// SELECT ANSWER — mark as pending save, then save immediately
-// ============================================================
-function selectAnswer(opt, labelEl) {
-    // Visual update
-    document.querySelectorAll('.option-label').forEach(l => l.classList.remove('selected'));
-    labelEl.classList.add('selected');
-    const badge = labelEl.querySelector('.option-badge');
-    document.querySelectorAll('.option-badge').forEach(b => {
-        b.style.background = '#e8eaf6';
-        b.style.color = '#3949ab';
+// ── SELECT ANSWER ────────────────────────────────────────────
+function selectAnswer(opt, label) {
+    if (examDone) return;
+    // Visual
+    document.querySelectorAll('.option-label').forEach(l => {
+        l.classList.remove('selected');
     });
-    if (badge) { badge.style.background = '#3949ab'; badge.style.color = '#fff'; }
+    label.classList.add('selected');
 
-    const wasAnswered = (selectedAnswer !== '' && selectedAnswer !== null);
+    const wasAnswered = !!selectedAnswer;
     selectedAnswer = opt;
-    pendingSave = true;
 
-    // Update answered count in sidebar if this is a new answer
+    // Update sidebar counts if new answer
     if (!wasAnswered) {
         answeredCount++;
-        updateSidebarCounts(answeredCount);
-        // Update nav grid button for current question
-        updateNavBtn(CURRENT_Q, 'answered');
+        updateCounts();
+        setQBtnClass(CURRENT_Q, isMarked ? 'marked' : 'answered');
     }
 
-    // Save immediately — do NOT wait (fire-and-forget here; goToQuestion will await)
-    saveAnswerAsync(opt, isMarked ? 1 : 0).then(ok => {
-        pendingSave = !ok;
-    });
+    // Save (fire — navigation will await if needed)
+    saveAnswerAsync();
 }
 
-// ============================================================
-// UPDATE SIDEBAR COUNTERS
-// ============================================================
-function updateSidebarCounts(answered) {
-    const remaining = TOTAL_Q - answered;
-    document.getElementById('legendAnswered').textContent  = answered;
-    document.getElementById('legendRemaining').textContent = remaining;
-    document.getElementById('summaryAnswered').textContent  = answered;
-    document.getElementById('summaryRemaining').textContent = remaining;
-    document.getElementById('finalAnswered').textContent    = answered;
-    document.getElementById('finalUnanswered').textContent  = remaining;
-}
-
-function updateNavBtn(qNum, cls) {
-    const btns = document.querySelectorAll('#qNavGrid .q-nav-btn');
-    const btn  = btns[qNum - 1];
-    if (!btn) return;
-    btn.className = 'q-nav-btn ' + cls;
-}
-
-// ============================================================
-// MARK FOR REVIEW
-// ============================================================
+// ── MARK FOR REVIEW ──────────────────────────────────────────
 function toggleMark() {
+    if (examDone) return;
     isMarked = !isMarked;
-    const btn = document.getElementById('markBtn');
-    btn.innerHTML = isMarked
-        ? '<i class="fas fa-bookmark me-1"></i>Unmark'
-        : '<i class="fas fa-bookmark me-1"></i>Mark for Review';
-    btn.className = isMarked ? 'btn btn-warning' : 'btn btn-outline-warning';
+    const btn  = document.getElementById('markBtn');
+    const btxt = document.getElementById('markBtnText');
+    const bdge = document.getElementById('markBadge');
+    btn.className  = 'btn btn-exam ' + (isMarked ? 'btn-warning' : 'btn-outline-warning');
+    btxt.textContent = isMarked ? 'Unmark' : 'Mark for Review';
+    if (bdge) bdge.style.display = isMarked ? '' : 'none!important';
 
-    // Update nav grid
-    const navCls = selectedAnswer ? (isMarked ? 'marked' : 'answered') : (isMarked ? 'marked' : 'unanswered');
-    updateNavBtn(CURRENT_Q, navCls);
+    markedCount += isMarked ? 1 : -1;
+    updateCounts();
+    const cls = selectedAnswer ? (isMarked ? 'marked' : 'answered') : (isMarked ? 'marked' : 'unanswered');
+    setQBtnClass(CURRENT_Q, cls);
 
-    // Update marked count
-    const markedCount = document.querySelectorAll('#qNavGrid .q-nav-btn.marked').length;
-    document.getElementById('legendMarked').textContent = markedCount;
-
-    saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
+    saveAnswerAsync();
 }
 
-// ============================================================
-// NAVIGATE — AWAIT SAVE FIRST, THEN REDIRECT
-// ============================================================
-async function goToQuestion(targetQ) {
-    if (examSubmitted) return;
-
-    // If a save is in progress or pending, wait for it
-    if (saveInProgress || pendingSave) {
-        await saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
-        pendingSave = false;
-    }
-
-    // Disable all nav buttons to prevent double-click
-    document.querySelectorAll('.q-nav-btn, .exam-actions .btn').forEach(b => b.disabled = true);
-
-    window.location.href = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${targetQ}`;
+// ── UPDATE UI COUNTS ─────────────────────────────────────────
+function updateCounts() {
+    const left = TOTAL_Q - answeredCount;
+    document.getElementById('legAnswered').textContent  = answeredCount;
+    document.getElementById('legMarked').textContent    = markedCount;
+    document.getElementById('legUnanswered').textContent = left;
+    document.getElementById('sumAnswered').textContent  = answeredCount;
+    document.getElementById('sumMarked').textContent    = markedCount;
+    document.getElementById('sumLeft').textContent      = left;
+    document.getElementById('modalAnswered').textContent   = answeredCount;
+    document.getElementById('modalUnanswered').textContent = left;
+    const pct = TOTAL_Q > 0 ? Math.round(answeredCount / TOTAL_Q * 100) : 0;
+    document.getElementById('progressBar').style.width = pct + '%';
+    document.getElementById('progressPct').textContent  = pct;
 }
 
-// ============================================================
-// FINISH MODAL
-// ============================================================
+function setQBtnClass(n, cls) {
+    const btn = document.getElementById('qbtn' + n);
+    if (btn) btn.className = 'q-btn ' + cls;
+    qStatus[n - 1] = cls;
+}
+
+// ── NAVIGATE ─────────────────────────────────────────────────
+async function goToQuestion(target) {
+    if (examDone || navLocked) return;
+    navLocked = true;
+
+    // Disable nav buttons visually
+    document.querySelectorAll('.q-btn, #btnPrev, #btnNext').forEach(b => b.disabled = true);
+    showToast('saving', 'Saving…');
+
+    await saveAnswerAsync();
+
+    // Always navigate even if save failed (answer is cached on server side)
+    window.location.href = `${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${target}`;
+}
+
+// ── FINISH MODAL ─────────────────────────────────────────────
 const finishModal = new bootstrap.Modal(document.getElementById('finishModal'));
 function showFinishModal() { finishModal.show(); }
 
-// ============================================================
-// SUBMIT EXAM
-// ============================================================
+// ── SUBMIT EXAM ──────────────────────────────────────────────
 async function submitExam(auto = false) {
-    if (examSubmitted && !auto) return;
-    examSubmitted = true;
-
+    if (examDone && !auto) return;
+    examDone = true;
     const btn = document.getElementById('confirmSubmitBtn');
-    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Submitting…'; }
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Submitting…'; }
 
-    // Save current answer before submitting
-    if (selectedAnswer || isMarked) {
-        await saveAnswerAsync(selectedAnswer || '', isMarked ? 1 : 0);
-    }
+    // Final save
+    await saveAnswerAsync();
 
     const fd = new FormData();
     fd.append('finish_exam', '1');
-    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+    const url = `${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
 
     try {
-        const res  = await fetch(url, { method: 'POST', body: fd });
-        const data = await res.json();
-        if (data.success) window.location.href = data.redirect;
-    } catch {
-        window.location.href = `result_view.php?attempt_id=${ATTEMPT_ID}`;
-    }
+        const r = await fetch(url, { method: 'POST', body: fd });
+        const d = await r.json();
+        if (d.success) { window.location.href = d.redirect; return; }
+    } catch {}
+    window.location.href = `result_view.php?attempt_id=${ATTEMPT_ID}`;
 }
 
-// ============================================================
-// VIOLATION MONITORING
-// ============================================================
-let violationActive = false;
+// ── VIOLATION MONITORING ─────────────────────────────────────
+let violActive = false;
 
 function recordViolation(type, desc) {
-    if (examSubmitted) return;
+    if (examDone) return;
     const fd = new FormData();
     fd.append('record_violation', '1');
     fd.append('violation_type',   type);
     fd.append('description',      desc);
-    const url = `${EXAM_BASE_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
+    const url = `${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${CURRENT_Q}`;
     fetch(url, { method: 'POST', body: fd })
         .then(r => r.json())
-        .then(data => {
-            violationCount = data.count;
-            document.getElementById('vCount').textContent = data.count;
-            if (data.terminated) {
-                document.getElementById('violationOverlay').classList.add('d-none');
-                document.getElementById('terminatedOverlay').classList.remove('d-none');
+        .then(d => {
+            violCount = d.count;
+            document.getElementById('vCount').textContent    = d.count;
+            const vc = document.getElementById('violCount');
+            if (vc) vc.textContent = d.count;
+            if (d.terminated) {
+                document.getElementById('violationOverlay').classList.remove('show');
+                document.getElementById('terminatedOverlay').classList.add('show');
             } else {
                 showViolation(desc);
             }
@@ -744,37 +1036,39 @@ function recordViolation(type, desc) {
 }
 
 function showViolation(msg) {
-    if (violationActive) return;
-    violationActive = true;
-    document.getElementById('violationMsg').textContent = msg || 'A rule violation was detected.';
-    document.getElementById('vCount').textContent = violationCount;
-    document.getElementById('violationOverlay').classList.remove('d-none');
+    if (violActive) return;
+    violActive = true;
+    document.getElementById('violationMsg').textContent = msg || 'A violation was detected.';
+    document.getElementById('violationOverlay').classList.add('show');
 }
 
 function dismissViolation() {
-    document.getElementById('violationOverlay').classList.add('d-none');
-    violationActive = false;
+    document.getElementById('violationOverlay').classList.remove('show');
+    violActive = false;
 }
 
+// Tab / window events
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden && !examSubmitted)
+    if (document.hidden && !examDone)
         recordViolation('tab_switch', 'Student switched browser tab or minimized window.');
 });
-
 window.addEventListener('blur', () => {
-    if (!examSubmitted) {
+    if (!examDone) {
         setTimeout(() => {
-            if (!document.hasFocus() && !examSubmitted)
-                recordViolation('window_blur', 'Student switched to another application or window.');
-        }, 300);
+            if (!document.hasFocus() && !examDone)
+                recordViolation('window_blur', 'Student switched to another application.');
+        }, 350);
     }
 });
-
 window.addEventListener('beforeunload', e => {
-    if (!examSubmitted) { e.preventDefault(); e.returnValue = ''; }
+    if (!examDone) { e.preventDefault(); e.returnValue = ''; }
 });
-
 document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('keydown', e => {
+    if (e.key === 'F5' || (e.ctrlKey && ['r','R'].includes(e.key))) {
+        e.preventDefault();
+    }
+});
 </script>
 </body>
 </html>

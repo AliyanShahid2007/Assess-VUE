@@ -101,7 +101,7 @@ $perfColor = $pct >= 90 ? 'success' : ($pct >= 75 ? 'info' : ($pct >= 60 ? 'warn
                 <!-- Student Photo -->
                 <div class="col-auto">
                     <?php if ($result['profile_picture']): ?>
-                        <img src="../admin/serve_file.php?type=profile&id=<?= $result['student_db_id'] ?>"
+                        <img src="serve_file.php?type=profile"
                              style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid <?= $result['result'] === 'PASS' ? '#43a047' : '#e53935' ?>">
                     <?php else: ?>
                         <div style="width:100px;height:100px;border-radius:50%;background:#e8eaf6;display:flex;align-items:center;justify-content:center;font-size:2.5rem;font-weight:700;color:#3949ab">

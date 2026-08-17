@@ -419,7 +419,7 @@ $bestPct        = $totalAttempts ? max(array_column($results, 'percentage')) : 0
         </div>
         <div class="av-user-chip">
             <?php if ($student['profile_picture']): ?>
-                <img src="../admin/serve_file.php?type=profile&id=<?= $studentId ?>"
+                <img src="serve_file.php?type=profile"
                      alt="<?= sanitize($student['full_name']) ?>">
             <?php else: ?>
                 <div class="av-user-avatar"><?= strtoupper(substr($student['full_name'],0,1)) ?></div>
@@ -724,7 +724,7 @@ $bestPct        = $totalAttempts ? max(array_column($results, 'percentage')) : 0
             <!-- Profile Card -->
             <div class="av-profile-card mb-4">
                 <?php if ($student['profile_picture']): ?>
-                    <img src="../admin/serve_file.php?type=profile&id=<?= $studentId ?>"
+                    <img src="serve_file.php?type=profile"
                          class="av-profile-pic" alt="">
                 <?php else: ?>
                     <div class="av-profile-avatar"><?= strtoupper(substr($student['full_name'],0,1)) ?></div>
