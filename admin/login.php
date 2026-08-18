@@ -4,6 +4,11 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/functions.php';
 startSecureSession();
 
+// Prevent browser from caching the login page (avoids stale CSRF token on back-button)
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
+
 // Already logged in
 if (isAdminLoggedIn()) {
     redirect('dashboard.php');
