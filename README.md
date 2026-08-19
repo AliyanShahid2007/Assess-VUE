@@ -8,8 +8,8 @@ A complete, professional, secure, and responsive Online Examination Management S
 
 | Portal | URL | Credentials |
 |---|---|---|
-| **Admin Panel** | [`/admin/login.php](https://assess-vue.ct.ws/admin/login.php)` | `admin` / `Aliy@n123` |
-| **Student Portal** | `[/student/login.php](https://assess-vue.ct.ws/admin/login.php)` | `stu-001` / `admin123` |
+| **Admin Panel** | https://assess-vue.ct.ws/admin/login.php | `admin` / `Aliy@n123` |
+| **Student Portal** | https://assess-vue.ct.ws/admin/login.php | `stu-001` / `admin123` |
 
 ---
 
