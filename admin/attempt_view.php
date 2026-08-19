@@ -100,9 +100,9 @@ function getOptText(array $q, string $opt): string {
                                 <?= $result['result'] ?>
                             </div>
                             <div style="font-size:2rem;font-weight:700">
-                                <?= number_format($result['percentage'], 1) ?>%
+                                <?= number_format((float)$result['percentage'], 2) ?>%
                             </div>
-                            <div class="text-muted"><?= $result['obtained_marks'] ?>/<?= $result['total_marks'] ?> Marks</div>
+                            <div class="text-muted">Net Score: <?= number_format((float)$result['obtained_marks'], 2) ?> / <?= number_format((float)$result['total_marks'], 2) ?></div>
                         </div>
                         <div class="row g-1 mt-2">
                             <div class="col-6"><div class="bg-success bg-opacity-10 p-2 rounded text-center">
@@ -120,6 +120,22 @@ function getOptText(array $q, string $opt): string {
                             <div class="col-6"><div class="bg-info bg-opacity-10 p-2 rounded text-center">
                                 <div class="fw-bold text-info"><?= $result['total_questions'] ?></div>
                                 <small class="text-muted">Total</small>
+                            </div></div>
+                            <div class="col-6"><div class="bg-success bg-opacity-10 p-2 rounded text-center">
+                                <div class="fw-bold text-success"><?= number_format((float)($result['obtained_marks'] + ($result['negative_marks_total'] ?? 0)), 2) ?></div>
+                                <small class="text-muted">Correct Marks</small>
+                            </div></div>
+                            <div class="col-6"><div class="bg-danger bg-opacity-10 p-2 rounded text-center">
+                                <div class="fw-bold text-danger"><?= number_format(-(float)($result['negative_marks_total'] ?? 0), 2) ?></div>
+                                <small class="text-muted">Wrong Marks</small>
+                            </div></div>
+                            <div class="col-6"><div class="bg-primary bg-opacity-10 p-2 rounded text-center">
+                                <div class="fw-bold text-primary"><?= number_format((float)$result['obtained_marks'], 2) ?></div>
+                                <small class="text-muted">Net Score</small>
+                            </div></div>
+                            <div class="col-6"><div class="bg-info bg-opacity-10 p-2 rounded text-center">
+                                <div class="fw-bold text-info"><?= number_format((float)$result['percentage'], 2) ?>%</div>
+                                <small class="text-muted">Percentage</small>
                             </div></div>
                         </div>
                     </div>

@@ -171,8 +171,9 @@ include 'includes/header.php';
                                 <div class="small text-muted"><?= $h['start_time'] ? formatTime($h['start_time']) : '' ?></div>
                             </td>
                             <td>
-                                <span class="fw-semibold"><?= number_format($h['percentage'], 1) ?>%</span>
-                                <div class="small text-muted"><?= $h['obtained_marks'] ?>/<?= $h['total_marks'] ?></div>
+                                <span class="fw-semibold">Percentage: <?= number_format((float)$h['percentage'], 2) ?>%</span>
+                                <div class="small text-muted">Correct: <?= number_format((float)($h['obtained_marks'] + ($h['negative_marks_total'] ?? 0)), 2) ?> | Wrong: <?= number_format(-(float)($h['negative_marks_total'] ?? 0), 2) ?></div>
+                                <div class="small text-muted">Net Score: <?= number_format((float)$h['obtained_marks'], 2) ?>/<?= number_format((float)$h['total_marks'], 2) ?></div>
                             </td>
                             <td>
                                 <span class="badge-status <?= $h['result'] === 'PASS' ? 'badge-pass' : 'badge-fail' ?>">

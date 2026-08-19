@@ -18,6 +18,7 @@ $errors   = [];
 
 $data = $sch ?: [
     'student_id' => sanitizeInt($_GET['student_id'] ?? 0),
+    'student_ids' => array_values(array_filter([sanitizeInt($_GET['student_id'] ?? 0)])),
     'exam_id' => 0, 'scheduled_date' => date('Y-m-d'),
     'start_time' => '09:00', 'duration_minutes' => 60, 'notes' => '',
     'attempt_allowed' => 1, 'status' => 'scheduled'
@@ -27,8 +28,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!verifyCsrfToken($_POST['csrf_token'] ?? '')) {
         $errors[] = 'Invalid security token.';
     } else {
+        if ($isEdit) {
+            $selectedStudentIds = [sanitizeInt($_POST['student_id'] ?? 0)];
+        } else {
+            $studentSelection = $_POST['student_selection'] ?? '';
+            if ($studentSelection === 'all') {
+                $selectedStudentIds = array_map('intval', array_column(
+                    db()->fetchAll('SELECT id FROM students WHERE is_active=1 ORDER BY full_name'),
+                    'id'
+                ));
+            } else {
+                $selectedStudentIds = [sanitizeInt($studentSelection)];
+            }
+            $selectedStudentIds = array_values(array_filter($selectedStudentIds));
+        }
+
         $data = [
-            'student_id'       => sanitizeInt($_POST['student_id'] ?? 0),
+            'student_id'       => $selectedStudentIds[0] ?? 0,
+            'student_ids'      => $selectedStudentIds,
+            'student_selection'=> $_POST['student_selection'] ?? '',
             'exam_id'          => sanitizeInt($_POST['exam_id'] ?? 0),
             'scheduled_date'   => $_POST['scheduled_date'] ?? '',
             'start_time'       => $_POST['start_time'] ?? '09:00',
@@ -38,11 +56,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'status'           => $isEdit ? ($_POST['status'] ?? 'scheduled') : 'scheduled',
         ];
 
-        if (!$data['student_id']) $errors[] = 'Select a student.';
+        if (!$selectedStudentIds) $errors[] = $isEdit ? 'Select a student.' : 'Select at least one student.';
         if (!$data['exam_id'])    $errors[] = 'Select an exam.';
         if (empty($data['scheduled_date'])) $errors[] = 'Exam date is required.';
         if (empty($data['start_time'])) $errors[] = 'Start time is required.';
         if ($data['duration_minutes'] < 5) $errors[] = 'Duration must be at least 5 minutes.';
+
+        if ($selectedStudentIds) {
+            $placeholders = implode(',', array_fill(0, count($selectedStudentIds), '?'));
+            $activeStudents = db()->fetchAll(
+                "SELECT id FROM students WHERE is_active=1 AND id IN ($placeholders)",
+                $selectedStudentIds
+            );
+            if (count($activeStudents) !== count($selectedStudentIds)) {
+                $errors[] = 'One or more selected students are unavailable.';
+            }
+        }
 
         if (empty($errors)) {
             // Calculate end time
@@ -59,12 +88,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                      $data['notes'], $data['attempt_allowed'], $data['status'], $editId]);
                 setFlash('success', 'Schedule updated!');
             } else {
-                db()->insert("INSERT INTO exam_schedules (student_id,exam_id,scheduled_date,start_time,end_time,duration_minutes,notes,attempt_allowed,created_by)
-                    VALUES (?,?,?,?,?,?,?,?,?)",
-                    [$data['student_id'], $data['exam_id'], $data['scheduled_date'],
-                     $data['start_time'], $endTime, $data['duration_minutes'],
-                     $data['notes'], $data['attempt_allowed'], $_SESSION['admin_id']]);
-                setFlash('success', 'Exam scheduled successfully!');
+                db()->beginTransaction();
+                try {
+                    foreach ($selectedStudentIds as $studentId) {
+                        db()->insert("INSERT INTO exam_schedules (student_id,exam_id,scheduled_date,start_time,end_time,duration_minutes,notes,attempt_allowed,created_by)
+                            VALUES (?,?,?,?,?,?,?,?,?)",
+                            [$studentId, $data['exam_id'], $data['scheduled_date'],
+                             $data['start_time'], $endTime, $data['duration_minutes'],
+                             $data['notes'], $data['attempt_allowed'], $_SESSION['admin_id']]);
+                    }
+                    db()->commit();
+                } catch (Throwable $e) {
+                    db()->rollBack();
+                    throw $e;
+                }
+                $count = count($selectedStudentIds);
+                setFlash('success', "Exam scheduled successfully for $count " . ($count === 1 ? 'student!' : 'students!'));
             }
             redirect('schedules.php');
         }
@@ -90,7 +129,8 @@ include 'includes/header.php';
             <?= csrfField() ?>
             <div class="row g-3">
                 <div class="col-12">
-                    <label class="form-label">Student <span class="text-danger">*</span></label>
+                    <label class="form-label"><?= $isEdit ? 'Student' : 'Students' ?> <span class="text-danger">*</span></label>
+                    <?php if ($isEdit): ?>
                     <select name="student_id" class="form-select" required onchange="fillDuration()">
                         <option value="0">— Select Student —</option>
                         <?php foreach ($students as $s): ?>
@@ -99,6 +139,18 @@ include 'includes/header.php';
                         </option>
                         <?php endforeach; ?>
                     </select>
+                    <?php else: ?>
+                    <select name="student_selection" class="form-select" required>
+                        <option value="">â€” Select Student â€”</option>
+                        <option value="all" <?= ($data['student_selection'] ?? '') === 'all' ? 'selected' : '' ?>>All Active Students</option>
+                        <?php foreach ($students as $s): ?>
+                        <option value="<?= $s['id'] ?>" <?= in_array((int)$s['id'], $data['student_ids'], true) && count($data['student_ids']) === 1 ? 'selected' : '' ?>>
+                            <?= sanitize($s['full_name']) ?> (<?= sanitize($s['student_id']) ?>)
+                        </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <div class="form-text">Choose “All Active Students” to schedule this exam for every active student, or select one student for an individual schedule.</div>
+                    <?php endif; ?>
                 </div>
                 <div class="col-12">
                     <label class="form-label">Examination <span class="text-danger">*</span></label>
@@ -167,5 +219,6 @@ function fillDuration() {
     const dur = opt.dataset.duration;
     if (dur) document.getElementById('durationField').value = dur;
 }
+
 </script>
 <?php include 'includes/footer.php'; ?>

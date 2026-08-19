@@ -132,8 +132,8 @@ $perfColor = $pct >= 90 ? 'success' : ($pct >= 75 ? 'info' : ($pct >= 60 ? 'warn
                         <div class="result-badge <?= $result['result'] === 'PASS' ? 'text-success' : 'text-danger' ?>">
                             <?= $result['result'] ?>
                         </div>
-                        <div style="font-size:2rem;font-weight:700"><?= number_format($pct, 1) ?>%</div>
-                        <div class="text-muted"><?= $result['obtained_marks'] ?>/<?= $result['total_marks'] ?></div>
+                        <div style="font-size:2rem;font-weight:700"><?= number_format($pct, 2) ?>%</div>
+                        <div class="text-muted">Net Score: <?= number_format((float)$result['obtained_marks'], 2) ?> / <?= number_format((float)$result['total_marks'], 2) ?></div>
                     </div>
                 </div>
             </div>
@@ -180,6 +180,22 @@ $perfColor = $pct >= 90 ? 'success' : ($pct >= 75 ? 'info' : ($pct >= 60 ? 'warn
                         <div class="col-4"><div class="p-2 bg-secondary bg-opacity-10 rounded text-center">
                             <div class="fw-bold text-secondary fs-5"><?= $result['unanswered'] ?></div>
                             <small class="text-muted">Skipped</small>
+                        </div></div>
+                        <div class="col-6"><div class="p-2 bg-success bg-opacity-10 rounded text-center">
+                            <div class="fw-bold text-success fs-6"><?= number_format((float)($result['obtained_marks'] + ($result['negative_marks_total'] ?? 0)), 2) ?></div>
+                            <small class="text-muted">Correct Marks</small>
+                        </div></div>
+                        <div class="col-6"><div class="p-2 bg-danger bg-opacity-10 rounded text-center">
+                            <div class="fw-bold text-danger fs-6"><?= number_format(-(float)($result['negative_marks_total'] ?? 0), 2) ?></div>
+                            <small class="text-muted">Wrong Marks</small>
+                        </div></div>
+                        <div class="col-6"><div class="p-2 bg-primary bg-opacity-10 rounded text-center">
+                            <div class="fw-bold text-primary fs-6"><?= number_format((float)$result['obtained_marks'], 2) ?></div>
+                            <small class="text-muted">Net Score</small>
+                        </div></div>
+                        <div class="col-6"><div class="p-2 bg-info bg-opacity-10 rounded text-center">
+                            <div class="fw-bold text-info fs-6"><?= number_format($pct, 2) ?>%</div>
+                            <small class="text-muted">Percentage</small>
                         </div></div>
                     </div>
                     <?php if ($result['violation_terminated']): ?>

@@ -65,7 +65,7 @@ include 'includes/header.php';
             </div>
             <div class="col-sm-3">
                 <select name="subject" class="form-select form-select-sm">
-                    <option value="0">All Subjects</option>
+                    <option value="0">All Categories</option>
                     <?php foreach ($subjects as $s): ?>
                     <option value="<?= $s['id'] ?>" <?= $subjectFilter == $s['id'] ? 'selected' : '' ?>><?= sanitize($s['name']) ?></option>
                     <?php endforeach; ?>
@@ -95,7 +95,7 @@ include 'includes/header.php';
                     <tr>
                         <th style="width:40px">#</th>
                         <th>Question</th>
-                        <th>Subject / Chapter</th>
+                        <th>Category / Chapter</th>
                         <th>Correct</th>
                         <th>Marks</th>
                         <th>Difficulty</th>

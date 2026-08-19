@@ -89,8 +89,8 @@ include 'includes/header.php';
                         <th>Student</th>
                         <th>Exam</th>
                         <th>Date</th>
-                        <th>Score</th>
-                        <th>%</th>
+                        <th>Score Breakdown</th>
+                        <th>Percentage</th>
                         <th>Pass %</th>
                         <th>Time Taken</th>
                         <th>Result</th>
@@ -113,9 +113,13 @@ include 'includes/header.php';
                         <div><?= formatDate($r['scheduled_date']) ?></div>
                         <small class="text-muted"><?= $r['start_time'] ? formatTime($r['start_time']) : '—' ?></small>
                     </td>
-                    <td class="fw-semibold"><?= $r['obtained_marks'] ?>/<?= $r['total_marks'] ?></td>
+                    <td class="small">
+                        <div>Correct: <strong class="text-success"><?= (int)$r['correct_answers'] ?>/<?= (int)$r['total_questions'] ?></strong></div>
+                        <div>Incorrect: <strong class="text-danger"><?= (int)$r['incorrect_answers'] ?></strong></div>
+                        <div>Score (out of 100): <strong><?= number_format((float)$r['percentage'], 2) ?>/100</strong></div>
+                    </td>
                     <td class="fw-bold <?= $r['percentage'] >= $r['passing_percentage'] ? 'text-success' : 'text-danger' ?>">
-                        <?= number_format($r['percentage'], 1) ?>%
+                        <?= number_format((float)$r['percentage'], 2) ?>%
                     </td>
                     <td class="text-muted"><?= $r['passing_percentage'] ?>%</td>
                     <td><?= $r['time_taken_seconds'] ? secondsToTime($r['time_taken_seconds']) : '—' ?></td>

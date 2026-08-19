@@ -17,7 +17,7 @@ $chapters  = db()->fetchAll("SELECT * FROM chapters WHERE is_active=1 ORDER BY s
 $errors = [];
 
 $data = $q ?: [
-    'subject_id' => '', 'chapter_id' => '', 'question_text' => '',
+    'subject_id' => sanitizeInt($_GET['subject_id'] ?? 0), 'chapter_id' => '', 'question_text' => '',
     'option_a' => '', 'option_b' => '', 'option_c' => '', 'option_d' => '',
     'correct_option' => 'A', 'difficulty' => 'medium', 'marks' => 1,
     'negative_marks' => 0, 'explanation' => ''
@@ -42,12 +42,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'explanation'   => trim($_POST['explanation'] ?? ''),
         ];
 
+        if (empty($data['subject_id']))    $errors[] = 'Please select a category / subject.';
         if (empty($data['question_text'])) $errors[] = 'Question text is required.';
         if (empty($data['option_a']))      $errors[] = 'Option A is required.';
         if (empty($data['option_b']))      $errors[] = 'Option B is required.';
         if (empty($data['option_c']))      $errors[] = 'Option C is required.';
         if (empty($data['option_d']))      $errors[] = 'Option D is required.';
         if (!in_array($data['correct_option'], ['A','B','C','D'])) $errors[] = 'Select a valid correct answer.';
+        if ($data['chapter_id']) {
+            $chapter = db()->fetchOne('SELECT id FROM chapters WHERE id=? AND subject_id=? AND is_active=1', [$data['chapter_id'], $data['subject_id']]);
+            if (!$chapter) $errors[] = 'Selected chapter does not belong to this category.';
+        }
+        if ($isEdit) {
+            $linkedExam = db()->fetchOne('SELECT e.exam_name FROM exam_questions eq JOIN exams e ON e.id=eq.exam_id WHERE eq.question_id=? AND e.subject_id IS NOT NULL AND e.subject_id<>? LIMIT 1', [$editId, $data['subject_id']]);
+            if ($linkedExam) $errors[] = 'This question is already used in the "' . $linkedExam['exam_name'] . '" exam and cannot be moved to another category.';
+        }
 
         if (empty($errors)) {
             if ($isEdit) {
@@ -96,8 +105,8 @@ include 'includes/header.php';
             <?= csrfField() ?>
             <div class="row g-3">
                 <div class="col-md-4">
-                    <label class="form-label">Subject</label>
-                    <select name="subject_id" class="form-select" id="subjectSel" onchange="loadChapters()">
+                    <label class="form-label">Category / Subject <span class="text-danger">*</span></label>
+                    <select name="subject_id" class="form-select" id="subjectSel" onchange="loadChapters()" required>
                         <option value="0">— Select Subject —</option>
                         <?php foreach ($subjects as $s): ?>
                         <option value="<?= $s['id'] ?>" <?= $data['subject_id'] == $s['id'] ? 'selected' : '' ?>><?= sanitize($s['name']) ?></option>

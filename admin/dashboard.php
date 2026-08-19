@@ -23,7 +23,7 @@ $stats = [
 
 // ---- Recent Results ----
 $recentResults = db()->fetchAll("
-    SELECT er.*, s.full_name, s.student_id as stu_id, e.exam_name, e.exam_code,
+    SELECT er.*, s.full_name, s.student_id as stu_id, e.exam_name, e.exam_code, e.total_marks AS exam_total_marks,
            ea.start_time, ea.end_time
     FROM exam_results er
     JOIN students s ON s.id = er.student_id
@@ -251,8 +251,8 @@ include 'includes/header.php';
                                     <small class="text-muted"><?= sanitize($r['exam_code']) ?></small>
                                 </td>
                                 <td>
-                                    <div class="fw-semibold"><?= number_format($r['percentage'], 1) ?>%</div>
-                                    <small class="text-muted"><?= $r['obtained_marks'] ?>/<?= $r['total_marks'] ?></small>
+                                    <div class="fw-semibold"><?= number_format((float)$r['percentage'], 1) ?>%</div>
+                                    <small class="text-muted"><?= number_format((float)$r['obtained_marks'], 2) ?>/<?= number_format((float)$r['exam_total_marks'], 2) ?> Marks</small>
                                 </td>
                                 <td>
                                     <span class="badge-status <?= $r['result'] === 'PASS' ? 'badge-pass' : 'badge-fail' ?>">

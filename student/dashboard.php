@@ -661,9 +661,6 @@ $bestPct        = $totalAttempts ? max(array_column($results, 'percentage')) : 0
                                             <?= number_format($pctVal, 1) ?>%
                                         </span>
                                     </div>
-                                    <div style="font-size:.75rem; color:#90a4ae; margin-top:.15rem;">
-                                        <?= $r['obtained_marks'] ?> / <?= $r['total_marks'] ?> marks
-                                    </div>
                                 </td>
                                 <td>
                                     <span class="av-result-badge <?= $r['result'] === 'PASS' ? 'av-pass' : 'av-fail' ?>">

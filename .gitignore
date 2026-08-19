@@ -10,5 +10,8 @@ uploads/temp/*
 .env
 *.log
 
+# Local database recovery exports; do not publish backups or their data.
+recovery_backup_*/
+
 # PM2
 .pm2/

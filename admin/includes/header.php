@@ -57,7 +57,7 @@ if (!defined('PAGE_TITLE')) define('PAGE_TITLE', APP_NAME);
 
         <div class="menu-label">SETTINGS</div>
         <a href="subjects.php" class="menu-item <?= basename($_SERVER['PHP_SELF']) === 'subjects.php' ? 'active' : '' ?>">
-            <i class="fas fa-book"></i><span>Subjects</span>
+            <i class="fas fa-book"></i><span>Categories</span>
         </a>
         <a href="logout.php" class="menu-item text-danger-item">
             <i class="fas fa-sign-out-alt"></i><span>Logout</span>

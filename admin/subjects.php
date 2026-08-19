@@ -4,7 +4,7 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/functions.php';
 startSecureSession();
 requireAdmin();
-define('PAGE_TITLE', 'Subjects & Chapters');
+define('PAGE_TITLE', 'Categories / Subjects');
 
 // Handle actions
 $action = $_POST['action'] ?? $_GET['action'] ?? '';
@@ -47,18 +47,18 @@ include 'includes/header.php';
 ?>
 <?= renderFlash() ?>
 
-<h2 class="mb-4"><i class="fas fa-book me-2 text-primary"></i>Subjects &amp; Chapters</h2>
+<h2 class="mb-4"><i class="fas fa-book me-2 text-primary"></i>Categories / Subjects &amp; Chapters</h2>
 
 <div class="row g-4">
     <div class="col-12 col-md-5">
         <div class="card">
-            <div class="card-header"><i class="fas fa-plus me-2"></i>Add Subject</div>
+            <div class="card-header"><i class="fas fa-plus me-2"></i>Add Category / Subject</div>
             <div class="card-body">
                 <form method="POST">
                     <?= csrfField() ?>
                     <input type="hidden" name="action" value="add_subject">
                     <div class="mb-2">
-                        <input type="text" name="name" class="form-control" placeholder="Subject Name *" required>
+                        <input type="text" name="name" class="form-control" placeholder="Category / Subject Name *" required>
                     </div>
                     <div class="mb-2">
                         <input type="text" name="code" class="form-control" placeholder="Code (e.g. WD101)" style="text-transform:uppercase">
@@ -72,7 +72,7 @@ include 'includes/header.php';
         </div>
 
         <div class="card mt-3">
-            <div class="card-header"><i class="fas fa-plus me-2"></i>Add Chapter</div>
+            <div class="card-header"><i class="fas fa-plus me-2"></i>Add Chapter / Topic</div>
             <div class="card-body">
                 <form method="POST">
                     <?= csrfField() ?>

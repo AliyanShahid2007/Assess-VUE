@@ -44,8 +44,9 @@ $questionId = (int)($_POST['question_id'] ?? 0);
 $answer     = strtoupper(trim($_POST['answer'] ?? ''));
 $isMark     = (int)(bool)($_POST['mark']  ?? 0);
 $qNum       = max(1, (int)($_POST['q_num'] ?? 1));
+$positionOnly = isset($_POST['position_only']);
 
-if (!$attemptId || !$questionId) {
+if (!$attemptId || (!$positionOnly && !$questionId)) {
     echo json_encode(['success' => false, 'error' => 'missing_params']);
     exit;
 }
@@ -66,6 +67,13 @@ if (!$attempt) {
 }
 if ($attempt['status'] !== 'in_progress') {
     echo json_encode(['success' => false, 'error' => 'attempt_not_active', 'status' => $attempt['status']]);
+    exit;
+}
+
+// Update the resume position while the client switches questions without a page reload.
+if ($positionOnly) {
+    db()->execute("UPDATE exam_attempts SET current_question = ? WHERE id = ?", [$qNum, $attemptId]);
+    echo json_encode(['success' => true]);
     exit;
 }
 

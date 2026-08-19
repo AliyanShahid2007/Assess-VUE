@@ -66,9 +66,11 @@ if ($remainSeconds <= 0) {
 
 // ── Load questions ───────────────────────────────────────────
 $questions = db()->fetchAll("
-    SELECT sa.*, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d
+    SELECT sa.*, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
+           eq.marks AS question_marks
     FROM student_answers sa
     JOIN questions q ON q.id = sa.question_id
+    JOIN exam_questions eq ON eq.exam_id = sa.exam_id AND eq.question_id = sa.question_id
     WHERE sa.attempt_id = ?
     ORDER BY sa.sort_order ASC",
     [$attemptId]
@@ -146,8 +148,8 @@ function calculateAndSaveResult(int $aid, int $sid, int $eid, array $a, bool $vi
     $correct    = $incorrect = $unanswered = 0;
     $obtained   = $negTotal  = 0;
 
-    $exam       = db()->fetchOne("SELECT total_marks, passing_percentage FROM exams WHERE id=?", [$eid]);
-    $totalMarks = (float)($exam['total_marks']        ?? 100);
+    $exam       = db()->fetchOne("SELECT passing_percentage FROM exams WHERE id=?", [$eid]);
+    $totalMarks = 100.0;
     $passPct    = (float)($exam['passing_percentage'] ?? 60);
 
     foreach ($answers as $an) {
@@ -161,7 +163,11 @@ function calculateAndSaveResult(int $aid, int $sid, int $eid, array $a, bool $vi
         }
     }
 
-    $pct    = $totalMarks > 0 ? round(($obtained / $totalMarks) * 100, 2) : 0;
+    // Keep the real net score (including negative marking) for reports. A
+    // percentage cannot be negative, so only its numerator is floored at zero.
+    $obtained = round((float)$obtained, 2);
+    $pct = $totalMarks > 0 ? round((max(0, $obtained) / $totalMarks) * 100, 2) : 0;
+    if ($pct > 100) $pct = 100;
     $result = (!$violated && $pct >= $passPct) ? 'PASS' : 'FAIL';
     $att    = db()->fetchOne("SELECT time_taken_seconds, schedule_id FROM exam_attempts WHERE id=?", [$aid]);
 
@@ -173,7 +179,7 @@ function calculateAndSaveResult(int $aid, int $sid, int $eid, array $a, bool $vi
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [$aid, $sid, $eid, $att['schedule_id'],
          $total, $correct + $incorrect, $correct, $incorrect, $unanswered,
-         $totalMarks, max(0, $obtained), $negTotal, $pct, $passPct, $result,
+         $totalMarks, $obtained, $negTotal, $pct, $passPct, $result,
          $violated ? 1 : 0, $att['time_taken_seconds'] ?? 0]
     );
 }
@@ -553,18 +559,15 @@ foreach ($questions as $q) {
     <!-- ── MAIN QUESTION PANEL ─────────────────────── -->
     <div class="exam-main">
         <?php if ($currentQ): ?>
-        <div class="question-card">
+        <div class="question-card" data-question-number="<?= $qNum ?>" data-question-id="<?= (int)$currentQ['question_id'] ?>">
 
             <!-- Header -->
             <div class="question-card-header">
                 <span class="q-number-badge">Question <?= $qNum ?> of <?= $totalQ ?></span>
-                <?php if ($currentQ['is_marked']): ?>
-                <span class="q-mark-badge"><i class="fas fa-bookmark"></i>Marked for Review</span>
-                <?php else: ?>
-                <span class="q-mark-badge" id="markBadge" style="display:none!important">
+                <span class="q-mark-badge"><i class="fas fa-star"></i><?= number_format((float)$currentQ['question_marks'], 2) ?> Marks</span>
+                <span class="q-mark-badge" id="markBadge"<?= $currentQ['is_marked'] ? '' : ' style="display:none!important"' ?>>
                     <i class="fas fa-bookmark"></i>Marked for Review
                 </span>
-                <?php endif; ?>
                 <span class="ms-auto" style="font-size:.78rem;color:#78909c;">
                     <i class="fas fa-clock me-1"></i>PKT: <?= date('h:i A') ?>
                 </span>
@@ -797,8 +800,8 @@ foreach ($questions as $q) {
 
 // ── Constants (from PHP) ─────────────────────────────────────
 const ATTEMPT_ID      = <?= $attemptId ?>;
-const CURRENT_Q       = <?= $qNum ?>;
-const CURRENT_QID     = <?= $currentQ ? (int)$currentQ['question_id'] : 0 ?>;
+let CURRENT_Q         = <?= $qNum ?>;
+let CURRENT_QID       = <?= $currentQ ? (int)$currentQ['question_id'] : 0 ?>;
 const TOTAL_Q         = <?= $totalQ ?>;
 const REMAIN_SECS_PHP = <?= $remainSeconds ?>;
 const MAX_VIOLATIONS  = <?= (int)$attempt['max_violations'] ?>;
@@ -867,6 +870,16 @@ async function doSave(answer, mark, qid, qNum) {
     fd.append('mark',        mark ? '1' : '0');
     fd.append('q_num',       qNum);
 
+    const resp = await fetch(SAVE_URL, { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return await resp.json();
+}
+
+async function updateAttemptPosition(qNum) {
+    const fd = new FormData();
+    fd.append('attempt_id', ATTEMPT_ID);
+    fd.append('q_num', qNum);
+    fd.append('position_only', '1');
     const resp = await fetch(SAVE_URL, { method: 'POST', body: fd });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     return await resp.json();
@@ -970,17 +983,47 @@ function setQBtnClass(n, cls) {
 
 // ── NAVIGATE ─────────────────────────────────────────────────
 async function goToQuestion(target) {
-    if (examDone || navLocked) return;
+    if (examDone || navLocked || target === CURRENT_Q) return;
     navLocked = true;
 
     // Disable nav buttons visually
     document.querySelectorAll('.q-btn, #btnPrev, #btnNext').forEach(b => b.disabled = true);
     showToast('saving', 'Saving…');
 
-    await saveAnswerAsync();
+    try {
+        await saveAnswerAsync();
+        await updateAttemptPosition(target);
 
-    // Always navigate even if save failed (answer is cached on server side)
-    window.location.href = `${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${target}`;
+        // Fetch and replace only the question area: the browser tab does not reload.
+        const response = await fetch(`${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${target}`, {
+            credentials: 'same-origin'
+        });
+        if (!response.ok) throw new Error('Could not load question');
+
+        const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const nextMain = doc.querySelector('.exam-main');
+        const nextSidebar = doc.querySelector('.exam-sidebar');
+        const nextCard = nextMain?.querySelector('.question-card');
+        if (!nextMain || !nextSidebar || !nextCard) throw new Error('Question data is unavailable');
+
+        document.querySelector('.exam-main').innerHTML = nextMain.innerHTML;
+        document.querySelector('.exam-sidebar').replaceWith(nextSidebar);
+        document.querySelector('.topbar-qnum').textContent = `Q ${target} / ${TOTAL_Q}`;
+
+        CURRENT_Q = Number(nextCard.dataset.questionNumber);
+        CURRENT_QID = Number(nextCard.dataset.questionId);
+        selectedAnswer = document.querySelector('input[name="answer"]:checked')?.value || '';
+        isMarked = document.getElementById('markBtn').classList.contains('btn-warning');
+        answeredCount = Number(document.getElementById('sumAnswered').textContent);
+        markedCount = Number(document.getElementById('sumMarked').textContent);
+        window.history.replaceState(null, '', `${EXAM_URL}?attempt_id=${ATTEMPT_ID}&q=${target}`);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) {
+        showToast('error', 'Could not load the next question. Please try again.');
+    } finally {
+        navLocked = false;
+        document.querySelectorAll('.q-btn, #btnPrev, #btnNext').forEach(b => b.disabled = false);
+    }
 }
 
 // ── FINISH MODAL ─────────────────────────────────────────────
@@ -1013,7 +1056,8 @@ async function submitExam(auto = false) {
 let violActive = false;
 
 function recordViolation(type, desc) {
-    if (examDone) return;
+    // Moving between questions is an intentional navigation, not a violation.
+    if (examDone || navLocked) return;
     const fd = new FormData();
     fd.append('record_violation', '1');
     fd.append('violation_type',   type);
@@ -1061,7 +1105,8 @@ window.addEventListener('blur', () => {
     }
 });
 window.addEventListener('beforeunload', e => {
-    if (!examDone) { e.preventDefault(); e.returnValue = ''; }
+    // Do not show the browser leave-page alert after Next/Previous saves an answer.
+    if (!examDone && !navLocked) { e.preventDefault(); e.returnValue = ''; }
 });
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('keydown', e => {

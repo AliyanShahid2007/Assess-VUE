@@ -4,6 +4,13 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/functions.php';
 startSecureSession();
 requireAdmin();
+
+// Handle cancellation before any HTML is sent, so the redirect remains valid.
+if (isset($_GET['clear'])) {
+    unset($_SESSION['pdf_questions'], $_SESSION['pdf_import_id'], $_SESSION['pdf_subject_id'], $_SESSION['pdf_chapter_id']);
+    redirect('pdf_import.php');
+}
+
 define('PAGE_TITLE', 'PDF Question Import');
 
 $subjects = db()->fetchAll("SELECT * FROM subjects WHERE is_active=1 ORDER BY name");
@@ -36,10 +43,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 
                 // Extract text from PDF
                 $extracted = extractQuestionsFromPdf($pdfPath);
-                $_SESSION['pdf_import_id'] = $importId;
-                $_SESSION['pdf_questions'] = $extracted;
-                $_SESSION['pdf_subject_id'] = sanitizeInt($_POST['subject_id'] ?? 0);
-                $_SESSION['pdf_chapter_id'] = sanitizeInt($_POST['chapter_id'] ?? 0);
+                if (empty($extracted)) {
+                    db()->execute("UPDATE pdf_imports SET status='failed' WHERE id=?", [$importId]);
+                    $errors[] = 'No questions were found in this PDF. Please use a PDF with selectable text and standard numbered MCQs.';
+                } else {
+                    $_SESSION['pdf_import_id'] = $importId;
+                    $_SESSION['pdf_questions'] = $extracted;
+                    $_SESSION['pdf_subject_id'] = sanitizeInt($_POST['subject_id'] ?? 0);
+                    $_SESSION['pdf_chapter_id'] = sanitizeInt($_POST['chapter_id'] ?? 0);
+                }
             } else {
                 $errors[] = $saved['message'];
             }
@@ -59,6 +71,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_questions'])) {
     $qNeg    = $_POST['q_neg']     ?? [];
     $subId   = sanitizeInt($_POST['save_subject'] ?? 0) ?: null;
     $chId    = sanitizeInt($_POST['save_chapter'] ?? 0) ?: null;
+
+    if (!$subId) {
+        setFlash('error', 'Please select a category / subject before saving questions.');
+        redirect('pdf_import.php');
+    }
+    if ($chId && !db()->fetchOne('SELECT id FROM chapters WHERE id=? AND subject_id=? AND is_active=1', [$chId, $subId])) {
+        setFlash('error', 'Selected chapter does not belong to the chosen category.');
+        redirect('pdf_import.php');
+    }
 
     $saved = 0;
     foreach ($qTexts as $i => $text) {
@@ -92,6 +113,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_questions'])) {
  * Basic PDF text extraction without external libraries.
  * Parses the raw PDF for text streams and attempts pattern matching.
  */
+function decodePdfTextString(string $value): string {
+    $value = preg_replace_callback('/\\\\([0-7]{1,3})/', fn(array $m): string => chr(octdec($m[1])), $value);
+
+    return strtr($value, [
+        '\\\\' => '\\\\', '\\(' => '(', '\\)' => ')', '\\n' => "\n",
+        '\\r' => "\r", '\\t' => "\t", '\\b' => "\b", '\\f' => "\f",
+    ]);
+}
+
+function decodeAscii85(string $value): string|false {
+    $value = preg_replace('/\s+/', '', $value);
+    $value = preg_replace('/^<~|~>$/', '', $value);
+    $decoded = '';
+    $group = [];
+
+    foreach (str_split($value) as $char) {
+        if ($char === 'z' && empty($group)) {
+            $decoded .= "\0\0\0\0";
+            continue;
+        }
+        $code = ord($char);
+        if ($code < 33 || $code > 117) {
+            continue;
+        }
+        $group[] = $code - 33;
+        if (count($group) === 5) {
+            $number = 0;
+            foreach ($group as $digit) $number = ($number * 85) + $digit;
+            $decoded .= chr(($number >> 24) & 255) . chr(($number >> 16) & 255)
+                . chr(($number >> 8) & 255) . chr($number & 255);
+            $group = [];
+        }
+    }
+    if (!empty($group)) {
+        $length = count($group);
+        while (count($group) < 5) $group[] = 84;
+        $number = 0;
+        foreach ($group as $digit) $number = ($number * 85) + $digit;
+        $bytes = chr(($number >> 24) & 255) . chr(($number >> 16) & 255)
+            . chr(($number >> 8) & 255) . chr($number & 255);
+        $decoded .= substr($bytes, 0, $length - 1);
+    }
+
+    return $decoded;
+}
+
+function extractPdfLiteralText(string $content): string {
+    $text = '';
+    if (preg_match_all('/\((?:\\\\.|[^\\\\)])*\)/s', $content, $matches)) {
+        foreach ($matches[0] as $literal) {
+            $literal = trim(decodePdfTextString(substr($literal, 1, -1)));
+            if ($literal !== '') $text .= $literal . "\n";
+        }
+    }
+    return $text;
+}
+
 function extractQuestionsFromPdf(string $pdfPath): array {
     $raw = @file_get_contents($pdfPath);
     if (!$raw) return [];
@@ -100,13 +178,22 @@ function extractQuestionsFromPdf(string $pdfPath): array {
     $text = '';
     if (preg_match_all('/stream\s*(.*?)\s*endstream/s', $raw, $matches)) {
         foreach ($matches[1] as $stream) {
-            // Try to decompress if zlib-compressed
+            $stream = trim($stream);
+            if (str_contains($stream, '~>')) {
+                $ascii85 = decodeAscii85($stream);
+                if ($ascii85 !== false && $ascii85 !== '') $stream = $ascii85;
+            }
+
+            // Support common PDF stream-compression variants.
             $decompressed = @gzuncompress($stream);
+            if ($decompressed === false) $decompressed = @gzdecode($stream);
+            if ($decompressed === false) $decompressed = @gzinflate($stream);
             if ($decompressed !== false) {
                 $text .= $decompressed . "\n";
+                $text .= extractPdfLiteralText($decompressed);
             } else {
-                // Try raw text extraction
                 $text .= $stream . "\n";
+                $text .= extractPdfLiteralText($stream);
             }
         }
     }
@@ -114,7 +201,7 @@ function extractQuestionsFromPdf(string $pdfPath): array {
     // Also try direct text extraction from PDF objects
     if (preg_match_all('/\(([^)]{5,})\)/', $raw, $directMatches)) {
         foreach ($directMatches[1] as $m) {
-            $decoded = preg_replace('/\\\\([0-7]{3})/', function($e) {
+            $decoded = preg_replace_callback('/\\\\([0-7]{3})/', function($e) {
                 return chr(octdec($e[1]));
             }, $m);
             $text .= ' ' . $decoded;
@@ -122,12 +209,52 @@ function extractQuestionsFromPdf(string $pdfPath): array {
     }
 
     // Clean up text
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
+    // Preserve selectable checkmarks long enough for detectCorrectOption().
+    $text = str_replace(['✓', '✔', '☑', '☒'], '[x]', $text);
     $text = preg_replace('/[^\x20-\x7E\n]/', ' ', $text);
-    $text = preg_replace('/\s+/', ' ', $text);
+    $text = preg_replace('/[ \t\x0B\f]+/', ' ', $text);
+    $text = preg_replace('/ *\n */', "\n", $text);
+    $text = preg_replace('/\n{3,}/', "\n\n", $text);
     $lines = array_map('trim', explode("\n", $text));
     $text = implode("\n", array_filter($lines));
 
     return parseQuestionsFromText($text);
+}
+
+function normaliseAnswerText(string $value): string {
+    $value = strtolower(trim($value));
+    $value = preg_replace('/[^a-z0-9]+/', ' ', $value);
+    return trim($value);
+}
+
+function detectCorrectOption(string $questionBody, array $options): string {
+    // Formats such as: Answer: B, Correct option (C), or Ans - D.
+    if (preg_match('/(?:correct\s*)?(?:answer|ans|option)\s*[:\-]?\s*(?:option\s*)?\(?([A-D])\)?\b/i', $questionBody, $match)) {
+        return strtoupper($match[1]);
+    }
+
+    // Textual tick/check markers beside an option (for text-based PDFs).
+    foreach ($options as $letter => $option) {
+        if (preg_match('/(?:^|\s)(?:\[x\]|\[\*\]|\*|correct)(?:\s|$)/i', trim($option))) {
+            return $letter;
+        }
+    }
+
+    // Formats such as: Answer: Islamabad. Match the answer text to an option.
+    if (preg_match('/(?:correct\s*)?(?:answer|ans)\s*[:\-]\s*(.+?)(?=\n|$)/i', $questionBody, $match)) {
+        $answer = normaliseAnswerText($match[1]);
+        if ($answer !== '') {
+            foreach ($options as $letter => $option) {
+                $candidate = normaliseAnswerText($option);
+                if ($candidate !== '' && ($candidate === $answer || str_contains($candidate, $answer) || str_contains($answer, $candidate))) {
+                    return $letter;
+                }
+            }
+        }
+    }
+
+    return 'A';
 }
 
 function parseQuestionsFromText(string $text): array {
@@ -155,33 +282,21 @@ function parseQuestionsFromText(string $text): array {
         $qNum  = (int)$qm[1];
         $qBody = trim($qm[2]);
 
-        // Extract options
-        $optA = $optB = $optC = $optD = '';
-
-        // Try standard A) B) C) D) or A. B. C. D. or (A) (B)
-        $optPatterns = [
-            '/[Aa][\.\)]\s*(.+?)(?=[Bb][\.\)]|$)/s',
-            '/\(a\)\s*(.+?)(?=\(b\)|$)/si',
-        ];
-
-        foreach ($optPatterns as $op) {
-            if (preg_match('/[Aa][\.\)]\s*(.+?)(?=[Bb][\.\)]|\n\s*[Bb][\.\)])/s', $qBody, $am)) {
-                $optA = trim(preg_replace('/\s+/', ' ', $am[1]));
+        // Extract standard A) / A. / (A) option blocks.
+        $options = ['A' => '', 'B' => '', 'C' => '', 'D' => ''];
+        foreach (array_keys($options) as $letter) {
+            $pattern = '/(?:^|\n)\s*\(?' . $letter . '\)?[\.\):\-]\s*(.+?)(?=\n\s*\(?[A-D]\)?[\.\):\-]|$)/is';
+            if (preg_match($pattern, $qBody, $optionMatch)) {
+                $options[$letter] = trim(preg_replace('/\s+/', ' ', $optionMatch[1]));
             }
-            if (preg_match('/[Bb][\.\)]\s*(.+?)(?=[Cc][\.\)]|\n\s*[Cc][\.\)])/s', $qBody, $bm)) {
-                $optB = trim(preg_replace('/\s+/', ' ', $bm[1]));
-            }
-            if (preg_match('/[Cc][\.\)]\s*(.+?)(?=[Dd][\.\)]|\n\s*[Dd][\.\)])/s', $qBody, $cm)) {
-                $optC = trim(preg_replace('/\s+/', ' ', $cm[1]));
-            }
-            if (preg_match('/[Dd][\.\)]\s*(.+?)$/s', $qBody, $dm)) {
-                $optD = trim(preg_replace('/\s+/', ' ', $dm[1]));
-            }
-            if ($optA) break;
         }
+        $optA = $options['A'];
+        $optB = $options['B'];
+        $optC = $options['C'];
+        $optD = $options['D'];
 
         // Extract question text (before options)
-        $qText = trim(preg_replace('/[Aa][\.\)].*/s', '', $qBody));
+        $qText = trim(preg_replace('/\n\s*\(?A\)?[\.\):\-].*/is', '', $qBody));
         $qText = trim(preg_replace('/\s+/', ' ', $qText));
 
         if (strlen($qText) < 5) continue;
@@ -193,7 +308,7 @@ function parseQuestionsFromText(string $text): array {
             'opt_b'   => $optB ?: '',
             'opt_c'   => $optC ?: '',
             'opt_d'   => $optD ?: '',
-            'correct' => 'A',
+            'correct' => detectCorrectOption($qBody, $options),
             'marks'   => 1,
             'neg'     => 0,
         ];
@@ -266,8 +381,8 @@ include 'includes/header.php';
                         <p id="uploadLabel" class="mb-1 fw-semibold">Click or drag & drop PDF here</p>
                         <p class="text-muted small mb-0">Maximum 20MB · PDF files only</p>
                     </div>
-                    <input type="file" name="pdf_file" id="pdfFile" style="display:none" accept=".pdf"
-                           onchange="this.form.submit();document.getElementById('uploadLabel').textContent=this.files[0].name">
+                    <input type="file" name="pdf_file" id="pdfFile" style="display:none" accept="application/pdf,.pdf"
+                           onchange="if (this.files.length) document.getElementById('uploadLabel').textContent=this.files[0].name">
                     <div class="row g-2 mt-2">
                         <div class="col-md-6">
                             <label class="form-label">Subject</label>
@@ -415,14 +530,15 @@ include 'includes/header.php';
 </form>
 <?php endif; ?>
 
-<?php
-if (isset($_GET['clear'])) {
-    unset($_SESSION['pdf_questions'], $_SESSION['pdf_import_id']);
-    redirect('pdf_import.php');
-}
-?>
-
 <script>
+document.getElementById('uploadForm')?.addEventListener('submit', function (event) {
+    const fileInput = document.getElementById('pdfFile');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        event.preventDefault();
+        document.getElementById('uploadLabel').textContent = 'Please select a PDF file first';
+    }
+});
+
 function handleDrop(e) {
     e.preventDefault();
     e.currentTarget.classList.remove('dragover');
@@ -430,7 +546,6 @@ function handleDrop(e) {
     if (file) {
         document.getElementById('pdfFile').files = e.dataTransfer.files;
         document.getElementById('uploadLabel').textContent = file.name;
-        document.getElementById('uploadForm').submit();
     }
 }
 </script>

@@ -481,6 +481,7 @@ $isTerminated = (bool)($terminatedAttempt && !$inProgressAttempt);
             <!-- Agreement + Submit Form -->
             <form method="POST" id="examForm" autocomplete="off">
                 <?= csrfField() ?>
+                <input type="hidden" name="start_exam" value="1">
 
                 <div class="agree-wrap" id="agreeWrap">
                     <input type="checkbox" id="agreeChk" name="agree">
@@ -491,7 +492,7 @@ $isTerminated = (bool)($terminatedAttempt && !$inProgressAttempt);
                 </div>
 
                 <div class="d-flex align-items-center gap-3 flex-wrap">
-                    <button type="submit" name="start_exam" value="1"
+                    <button type="submit"
                             id="startBtn"
                             class="btn-begin <?= $isResume ? 'resume' : '' ?>"
                             disabled>

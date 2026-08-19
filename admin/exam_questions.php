@@ -8,6 +8,8 @@ requireAdmin();
 $exam_id = sanitizeInt($_GET['exam_id'] ?? 0);
 $exam = db()->fetchOne("SELECT * FROM exams WHERE id=?", [$exam_id]);
 if (!$exam) { setFlash('error','Exam not found.'); redirect('exams.php'); }
+$examSubjectId = (int)($exam['subject_id'] ?? 0);
+$examCategory = $examSubjectId ? db()->fetchOne('SELECT name FROM subjects WHERE id=?', [$examSubjectId]) : null;
 
 define('PAGE_TITLE', 'Exam Questions: ' . $exam['exam_name']);
 
@@ -15,13 +17,22 @@ define('PAGE_TITLE', 'Exam Questions: ' . $exam['exam_name']);
 if (isset($_GET['remove'])) {
     $qid = sanitizeInt($_GET['remove']);
     db()->execute("DELETE FROM exam_questions WHERE exam_id=? AND question_id=?", [$exam_id, $qid]);
+    distributeExamMarks($exam_id);
     setFlash('success', 'Question removed.');
     redirect("exam_questions.php?exam_id=$exam_id");
 }
 
 // Handle add selected questions
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_questions'])) {
-    $qids = array_map('intval', $_POST['q_ids'] ?? []);
+    $requestedQids = array_values(array_unique(array_filter(array_map('intval', $_POST['q_ids'] ?? []))));
+    $qids = [];
+    if ($requestedQids) {
+        $placeholders = implode(',', array_fill(0, count($requestedQids), '?'));
+        $questionRows = db()->fetchAll("SELECT id FROM questions WHERE is_active=1 AND id IN ($placeholders)"
+            . ($examSubjectId ? ' AND subject_id=?' : ''),
+            array_merge($requestedQids, $examSubjectId ? [$examSubjectId] : []));
+        $qids = array_map('intval', array_column($questionRows, 'id'));
+    }
     $order = db()->fetchOne("SELECT MAX(sort_order) as m FROM exam_questions WHERE exam_id=?", [$exam_id])['m'] ?? 0;
     foreach ($qids as $qid) {
         $exists = db()->fetchOne("SELECT id FROM exam_questions WHERE exam_id=? AND question_id=?", [$exam_id, $qid]);
@@ -31,11 +42,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_questions'])) {
                 [$exam_id, $qid, $order, $exam['marks_per_question'], $exam['negative_marks']]);
         }
     }
-    setFlash('success', count($qids) . ' question(s) added.');
+    distributeExamMarks($exam_id);
+    $skipped = count($requestedQids) - count($qids);
+    setFlash('success', $skipped
+        ? count($qids) . " question(s) added. $skipped question(s) were skipped because they do not belong to this exam category."
+        : count($qids) . ' question(s) added.');
     redirect("exam_questions.php?exam_id=$exam_id");
 }
 
 // Current questions
+// Keep existing exams aligned as well: total_marks is shared across every assigned question.
+distributeExamMarks($exam_id);
 $currentQs = db()->fetchAll("
     SELECT eq.*, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option,
            q.difficulty, sub.name as subject_name, ch.name as chapter_name
@@ -50,7 +67,7 @@ $currentQs = db()->fetchAll("
 
 // Available questions (not yet added)
 $subjects = db()->fetchAll("SELECT * FROM subjects WHERE is_active=1 ORDER BY name");
-$filterSubject = sanitizeInt($_GET['filter_subject'] ?? 0);
+$filterSubject = $examSubjectId ?: sanitizeInt($_GET['filter_subject'] ?? 0);
 $filterSearch  = trim($_GET['filter_search'] ?? '');
 
 $aWhere = "WHERE q.is_active=1 AND q.id NOT IN (SELECT question_id FROM exam_questions WHERE exam_id=?)";
@@ -82,7 +99,7 @@ include 'includes/header.php';
     <a href="exams.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-1"></i>Exams</a>
     <div>
         <h2 class="mb-0"><?= sanitize($exam['exam_name']) ?></h2>
-        <small class="text-muted">Code: <?= sanitize($exam['exam_code']) ?> | Duration: <?= $exam['duration_minutes'] ?> min | Pass: <?= $exam['passing_percentage'] ?>%</small>
+        <small class="text-muted">Code: <?= sanitize($exam['exam_code']) ?> | Duration: <?= $exam['duration_minutes'] ?> min | Total: <?= number_format((float)$exam['total_marks'], 2) ?> marks | Pass: <?= $exam['passing_percentage'] ?>%<?php if ($examCategory): ?> | Category: <?= sanitize($examCategory['name']) ?><?php endif; ?></small>
     </div>
 </div>
 
@@ -106,7 +123,7 @@ include 'includes/header.php';
                             <small class="text-muted">
                                 Correct: <span class="badge bg-success"><?= $q['correct_option'] ?></span>
                                 | <?= $q['subject_name'] ?? '—' ?>
-                                | Marks: <?= $q['marks'] ?>
+                                | Marks: <?= number_format((float)$q['marks'], 2) ?>
                                 <span class="badge bg-<?= $q['difficulty'] === 'easy' ? 'success' : ($q['difficulty'] === 'hard' ? 'danger' : 'warning') ?> ms-1">
                                     <?= ucfirst($q['difficulty']) ?>
                                 </span>
@@ -150,10 +167,20 @@ include 'includes/header.php';
             <div class="card-body border-bottom">
                 <form method="GET" class="row g-2">
                     <input type="hidden" name="exam_id" value="<?= $exam_id ?>">
-                    <div class="col-8">
+                    <div class="col-<?= $examSubjectId ? '8' : '5' ?>">
                         <input type="text" name="filter_search" class="form-control form-control-sm"
                                placeholder="Search questions..." value="<?= sanitize($filterSearch) ?>">
                     </div>
+                    <?php if (!$examSubjectId): ?>
+                    <div class="col-3">
+                        <select name="filter_subject" class="form-select form-select-sm">
+                            <option value="0">All Categories</option>
+                            <?php foreach ($subjects as $s): ?>
+                            <option value="<?= $s['id'] ?>" <?= $filterSubject == $s['id'] ? 'selected' : '' ?>><?= sanitize($s['name']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <?php endif; ?>
                     <div class="col-4">
                         <button class="btn btn-sm btn-outline-primary w-100" type="submit">
                             <i class="fas fa-search me-1"></i>Filter
@@ -195,7 +222,7 @@ include 'includes/header.php';
                     <button type="submit" class="btn btn-success btn-sm">
                         <i class="fas fa-plus me-1"></i>Add Selected
                     </button>
-                    <a href="question_add.php" class="btn btn-outline-primary btn-sm">
+                    <a href="question_add.php?ref=exam&amp;exam_id=<?= $exam_id ?><?= $examSubjectId ? '&amp;subject_id=' . $examSubjectId : '' ?>" class="btn btn-outline-primary btn-sm">
                         <i class="fas fa-plus-circle me-1"></i>Create New Question
                     </a>
                 </div>

@@ -34,7 +34,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'total_questions'    => sanitizeInt($_POST['total_questions'] ?? 50),
             'marks_per_question' => sanitizeFloat($_POST['marks_per_question'] ?? 1),
             'negative_marks'     => sanitizeFloat($_POST['negative_marks'] ?? 0),
-            'total_marks'        => sanitizeFloat($_POST['total_marks'] ?? 100),
+            // Every exam is scored out of 100; individual question marks are distributed from this.
+            'total_marks'        => 100.00,
             'passing_percentage' => sanitizeFloat($_POST['passing_percentage'] ?? 60),
             'duration_minutes'   => sanitizeInt($_POST['duration_minutes'] ?? 60),
             'max_violations'     => sanitizeInt($_POST['max_violations'] ?? 3),
@@ -46,7 +47,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (empty($data['exam_name'])) $errors[] = 'Exam name is required.';
         if (empty($data['exam_code'])) $errors[] = 'Exam code is required.';
+        if (empty($data['subject_id'])) $errors[] = 'Please select an exam category / subject.';
         if ($data['duration_minutes'] < 5) $errors[] = 'Duration must be at least 5 minutes.';
+        if ($isEdit && $data['subject_id']) {
+            $differentCategoryQuestion = db()->fetchOne('SELECT q.id FROM exam_questions eq JOIN questions q ON q.id=eq.question_id WHERE eq.exam_id=? AND (q.subject_id IS NULL OR q.subject_id<>?) LIMIT 1', [$editId, $data['subject_id']]);
+            if ($differentCategoryQuestion) $errors[] = 'This exam already contains questions from another category. Remove or recategorize them before changing the exam category.';
+        }
 
         // Unique code check
         $codeExists = db()->fetchOne(
@@ -62,6 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     passing_percentage=?,duration_minutes=?,max_violations=?,shuffle_questions=?,
                     shuffle_options=?,instructions=?,status=? WHERE id=?",
                     [...array_values($data), $editId]);
+                distributeExamMarks($editId);
                 setFlash('success', 'Exam updated!');
                 redirect('exams.php');
             } else {
@@ -109,8 +116,8 @@ include 'includes/header.php';
                                    value="<?= sanitize($data['exam_code']) ?>" placeholder="e.g. WD-2024" style="text-transform:uppercase">
                         </div>
                         <div class="col-md-6">
-                            <label class="form-label">Subject</label>
-                            <select name="subject_id" class="form-select">
+                            <label class="form-label">Category / Subject <span class="text-danger">*</span></label>
+                            <select name="subject_id" class="form-select" required>
                                 <option value="0">— Select Subject —</option>
                                 <?php foreach ($subjects as $sub): ?>
                                 <option value="<?= $sub['id'] ?>" <?= $data['subject_id'] == $sub['id'] ? 'selected' : '' ?>>
@@ -146,8 +153,9 @@ include 'includes/header.php';
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">Marks Per Question</label>
-                            <input type="number" name="marks_per_question" class="form-control" min="0.5" step="0.5"
-                                   value="<?= $data['marks_per_question'] ?>" oninput="calcTotal()">
+                            <input type="number" name="marks_per_question" id="marksPerQuestion" class="form-control" step="0.01"
+                                   value="<?= $data['marks_per_question'] ?>" readonly>
+                            <small class="text-muted">Calculated automatically from total marks and question count.</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">Negative Marks</label>
@@ -157,7 +165,8 @@ include 'includes/header.php';
                         <div class="col-md-4">
                             <label class="form-label">Total Marks</label>
                             <input type="number" name="total_marks" id="totalMarks" class="form-control"
-                                   value="<?= $data['total_marks'] ?>">
+                                   value="100" readonly>
+                            <small class="text-muted">Fixed at 100 for every exam.</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">Passing Percentage (%)</label>
@@ -215,10 +224,11 @@ include 'includes/header.php';
 </form>
 
 <script>
-function calcTotal() {
+function calcMarksPerQuestion() {
     const q = parseFloat(document.querySelector('[name=total_questions]').value) || 0;
-    const m = parseFloat(document.querySelector('[name=marks_per_question]').value) || 0;
-    document.getElementById('totalMarks').value = (q * m).toFixed(2);
+    const total = parseFloat(document.getElementById('totalMarks').value) || 0;
+    document.getElementById('marksPerQuestion').value = q > 0 ? (total / q).toFixed(2) : '0.00';
 }
+document.querySelector('[name=total_questions]').addEventListener('input', calcMarksPerQuestion);
 </script>
 <?php include 'includes/footer.php'; ?>

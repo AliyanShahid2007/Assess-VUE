@@ -77,6 +77,39 @@ function sanitizeFloat(mixed $input): float {
     return (float)filter_var($input, FILTER_SANITIZE_NUMBER_FLOAT, FILTER_FLAG_ALLOW_FRACTION);
 }
 
+/**
+ * Split an exam's total marks equally across its currently assigned questions.
+ * Amounts are kept in cents so their sum always exactly equals total_marks.
+ */
+function distributeExamMarks(int $examId): void {
+    $exam = db()->fetchOne('SELECT id FROM exams WHERE id=?', [$examId]);
+    if (!$exam) return;
+
+    // The system has one grading scale: every exam is out of 100 marks.
+    db()->execute('UPDATE exams SET total_marks=100.00 WHERE id=?', [$examId]);
+    $questions = db()->fetchAll(
+        'SELECT id FROM exam_questions WHERE exam_id=? ORDER BY sort_order ASC, id ASC',
+        [$examId]
+    );
+    $count = count($questions);
+    if ($count === 0) return;
+
+    $totalCents = 10000;
+    $baseCents  = intdiv($totalCents, $count);
+    $remainder  = $totalCents % $count;
+
+    foreach ($questions as $index => $question) {
+        // Give the first few questions one extra cent to preserve the exact total.
+        $marks = ($baseCents + ($index < $remainder ? 1 : 0)) / 100;
+        db()->execute('UPDATE exam_questions SET marks=? WHERE id=?', [$marks, $question['id']]);
+    }
+
+    db()->execute(
+        'UPDATE exams SET marks_per_question=? WHERE id=?',
+        [round($totalCents / $count / 100, 2), $examId]
+    );
+}
+
 // ---- Flash Messages ----------------------------------------
 function setFlash(string $type, string $message): void {
     $_SESSION['flash'][$type] = $message;
@@ -118,10 +151,18 @@ function validateImageUpload(array $file): array {
     if (!in_array($ext, ALLOWED_IMAGE_EXTS)) {
         return ['success' => false, 'message' => 'Invalid file type. Allowed: JPG, JPEG, PNG, WEBP'];
     }
-    // MIME check
-    $finfo = finfo_open(FILEINFO_MIME_TYPE);
-    $mime = finfo_file($finfo, $file['tmp_name']);
-    finfo_close($finfo);
+    // MIME check. Use Fileinfo when available; some XAMPP installations
+    // have the extension disabled, so fall back to PHP's image parser.
+    if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime = $finfo ? finfo_file($finfo, $file['tmp_name']) : false;
+        if ($finfo) {
+            finfo_close($finfo);
+        }
+    } else {
+        $imageInfo = @getimagesize($file['tmp_name']);
+        $mime = $imageInfo['mime'] ?? false;
+    }
     if (!in_array($mime, ALLOWED_IMAGE_TYPES)) {
         return ['success' => false, 'message' => 'Invalid file content detected.'];
     }
@@ -129,6 +170,9 @@ function validateImageUpload(array $file): array {
 }
 
 function validatePdfUpload(array $file): array {
+    if ($file['error'] === UPLOAD_ERR_NO_FILE) {
+        return ['success' => false, 'message' => 'Please select a PDF file before uploading.'];
+    }
     if ($file['error'] !== UPLOAD_ERR_OK) {
         return ['success' => false, 'message' => 'Upload error: ' . $file['error']];
     }
@@ -139,9 +183,21 @@ function validatePdfUpload(array $file): array {
     if ($ext !== 'pdf') {
         return ['success' => false, 'message' => 'Only PDF files allowed.'];
     }
-    $finfo = finfo_open(FILEINFO_MIME_TYPE);
-    $mime = finfo_file($finfo, $file['tmp_name']);
-    finfo_close($finfo);
+    if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime = $finfo ? finfo_file($finfo, $file['tmp_name']) : false;
+        if ($finfo) {
+            finfo_close($finfo);
+        }
+    } else {
+        // Fallback for hosts without Fileinfo: require a real PDF header.
+        $handle = @fopen($file['tmp_name'], 'rb');
+        $header = $handle ? fread($handle, 5) : false;
+        if ($handle) {
+            fclose($handle);
+        }
+        $mime = $header === '%PDF-' ? 'application/pdf' : false;
+    }
     if ($mime !== 'application/pdf') {
         return ['success' => false, 'message' => 'Invalid file content. Must be a PDF.'];
     }

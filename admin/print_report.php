@@ -85,7 +85,7 @@ $pct = (float)$result['percentage'];
         </div>
         <div class="result-box <?= $result['result'] === 'PASS' ? 'result-pass' : 'result-fail' ?>">
             <div class="result-text"><?= $result['result'] ?></div>
-            <div class="result-pct"><?= number_format($pct, 1) ?>%</div>
+            <div class="result-pct"><?= number_format($pct, 2) ?>%</div>
             <div style="font-size:10px;color:#777">Required: <?= $result['passing_percentage'] ?>%</div>
         </div>
     </div>
@@ -119,8 +119,10 @@ $pct = (float)$result['percentage'];
         <div class="stat-item"><div class="stat-val" style="color:#c62828"><?= $result['incorrect_answers'] ?></div><div class="stat-lbl">Incorrect</div></div>
         <div class="stat-item"><div class="stat-val" style="color:#78909c"><?= $result['unanswered'] ?></div><div class="stat-lbl">Unanswered</div></div>
         <div class="stat-item"><div class="stat-val" style="color:#4527a0"><?= $result['total_marks'] ?></div><div class="stat-lbl">Total Marks</div></div>
-        <div class="stat-item"><div class="stat-val" style="color:<?= $result['result'] === 'PASS' ? '#2e7d32' : '#c62828' ?>"><?= $result['obtained_marks'] ?></div><div class="stat-lbl">Obtained Marks</div></div>
-        <div class="stat-item"><div class="stat-val" style="color:<?= $result['result'] === 'PASS' ? '#2e7d32' : '#c62828' ?>"><?= number_format($pct, 1) ?>%</div><div class="stat-lbl">Percentage</div></div>
+        <div class="stat-item"><div class="stat-val" style="color:#2e7d32"><?= number_format((float)($result['obtained_marks'] + ($result['negative_marks_total'] ?? 0)), 2) ?></div><div class="stat-lbl">Correct Marks</div></div>
+        <div class="stat-item"><div class="stat-val" style="color:#c62828"><?= number_format(-(float)($result['negative_marks_total'] ?? 0), 2) ?></div><div class="stat-lbl">Wrong Marks</div></div>
+        <div class="stat-item"><div class="stat-val" style="color:<?= $result['result'] === 'PASS' ? '#2e7d32' : '#c62828' ?>"><?= number_format((float)$result['obtained_marks'], 2) ?></div><div class="stat-lbl">Net Score</div></div>
+        <div class="stat-item"><div class="stat-val" style="color:<?= $result['result'] === 'PASS' ? '#2e7d32' : '#c62828' ?>"><?= number_format($pct, 2) ?>%</div><div class="stat-lbl">Percentage</div></div>
     </div>
 
     <?php if ($result['violation_terminated']): ?>
